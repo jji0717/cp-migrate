@@ -1,0 +1,2445 @@
+#include <sys/types.h>
+#include <unistd.h>
+#include <stdio.h> //debugging
+#include <sys/extattr.h>
+#include <sys/errno.h>
+
+#include <ifs/ifs_types.h>
+#include <isi_util/isi_error.h>
+#include <isi_ilog/ilog.h>
+#include <isi_util_cpp/isi_exception.h>
+#include <isi_ufp/isi_ufp.h>
+#include <isi_cloud_common/isi_cpool_version.h>
+#include <isi_cpool_d_common/ifs_cpool_flock.h>
+#include "isi_cpool_cbm.h"
+#include "isi_cbm_cache.h"
+#include "isi_cbm_invalidate.h"
+#include "isi_cbm_file.h"
+#include "isi_cbm_error.h"
+#include "isi_cbm_mapper.h"
+
+#ifdef OVERRIDE_ILOG_FOR_DEBUG
+#if defined(ilog)
+#undef ilog
+#endif
+#define ilog(a, args...) \
+	{\
+	struct fmt FMT_INIT_CLEAN(thisfmt);\
+	fmt_print(&thisfmt, args);\
+	fprintf(stderr, "%s\n", fmt_string(&thisfmt));	\
+	}
+#endif
+
+static ssize_t
+cache_pwrite(const char *func, int fd, const void *buf,
+    size_t sz, off_t off, int extra_flags)
+{
+	ilog(IL_CP_EXT,
+	    "%s: pwrite called with fd: %d, len: %ld, "
+	    "offset: %ld, extra flags: %d",
+	    func, fd, sz, off, extra_flags);
+
+	struct iovec vec[1];
+	int vec_cnt = 1;
+
+	vec[0].iov_base = (void *)buf;
+	vec[0].iov_len = sz;
+	return ifs_cpool_pwritev(fd, vec, vec_cnt, off,
+	    (extra_flags | O_SYNC | O_IGNORETIME));
+}
+
+MAKE_ENUM_FMT(cache_cpool_lock_type, enum cpool_lock_type,
+    ENUM_VAL(CPOOL_LK_SR,	"Shared Read"),
+    ENUM_VAL(CPOOL_LK_SW,	"Shared Write"),
+    ENUM_VAL(CPOOL_LK_X,	"Exclusive"),
+    ENUM_VAL(CPOOL_LK_UNLCK,	"Unlock"),
+    ENUM_VAL(CPOOL_LK_UNSPEC,	"Unspecified"),
+);
+
+/*
+ * cacheheader flags values - These correspond to the shift offset for the
+ * corresponding bits for the flag values found in the flags field of the
+ * cacheheader.  Be sure this is in sync with those flag bits found in .h
+ */
+static const char *cpool_cache_flags_val[] = {
+	"INVALIDATE",
+	"TRUNCATE",
+	"CACHEDDATA",
+	"DIRTY",
+	"SYNC",
+	"CACHED",
+	"INVALIDATE_IP",
+};
+#define CPOOL_CACHE_MAX_FLAG_VALUES  \
+	(sizeof(cpool_cache_flags_val)/sizeof(char *))
+
+static off_t
+isi_byte_in_rangemap(off_t region)
+{
+	return (region * ISI_CBM_CACHE_BITS_PER_ENTRY) /
+	    ISI_CBM_CACHE_BITS_PER_STATUS;
+}
+
+static off_t
+isi_cacheinfo_offset(off_t region)
+{
+	return ISI_CBM_CACHE_DEFAULT_CACHEOFFSET +
+	    sizeof(struct cpool_cache_header) + isi_byte_in_rangemap(region);
+}
+
+static char
+isi_cacheinfo_shift(off_t region)
+{
+	return region % (ISI_CBM_CACHE_BITS_PER_STATUS /
+	    ISI_CBM_CACHE_BITS_PER_ENTRY);
+}
+
+void
+cpool_cache::refresh_fully_cached_state(int fd, struct isi_error **error_out)
+{
+	struct isi_error *error = NULL;
+
+	struct stat stat = {0};
+
+	if (fstat(fd, &stat) != 0) {
+		error = isi_system_error_new(errno,
+		    "Cannot stat file %{} "
+		    "for refresh_fully_cached_state",
+		    isi_cbm_file_fmt(file_obj_));
+		goto out;
+
+	}
+	fully_cached_ =  ((stat.st_flags & SF_CACHED_STUB) != 0);
+ out:
+	isi_error_handle(error, error_out);
+}
+
+void
+cpool_cache::cache_open(int fd, bool already_locked, bool keep_locked,
+    struct isi_error **error_out)
+{
+	cache_open_common(fd, already_locked, keep_locked, false, error_out);
+	return;
+}
+
+bool
+cpool_cache::cache_open_create(int fd, bool already_locked, bool keep_locked,
+    struct isi_error **error_out)
+{
+	return cache_open_common(fd,
+	    already_locked, keep_locked, true, error_out);
+
+}
+
+/*
+ * Given the file descriptor for a file, open the cacheinfo.  If the open does
+ * not correspond to a create operation, read the cacheinfo header. Returns
+ * true if cache was created and needs initialization.
+ *
+ * fd[: the file descriptor for the file to do the cach open
+ *
+ * already_locked: The cache header is already locked on entry
+ *
+ * keep_locked: hold the cache header locked on return, unless there
+ *    is an error in which case it will be in the same state as it was
+ *    on entry.
+ *
+ * create: attempt to create the cache so it can then be
+ *    initialized.  If another thread beats us to the create, then
+ *    just open
+ *
+ * error_out: errors if any
+ */
+bool
+cpool_cache::cache_open_common(int fd, bool already_locked, bool keep_locked,
+    bool create, struct isi_error **error_out)
+{
+	int	adsd_fd		= -1;
+	int	attr_fd		= -1;
+	int	openflags	= 0;	/* flags for opening ADS stream */
+	bool	needs_init	= create;
+	bool	ch_locked	= already_locked;
+	bool	open_mtx_locked	= false;
+
+	struct isi_error *error	= NULL;
+
+	ASSERT(error_out && *error_out == NULL);
+	ASSERT(fd >= 0);
+	ASSERT(fd == file_obj_->fd);
+	if (!already_locked) {
+		ASSERT(dir_fd_ == -1);
+		ASSERT(fd_ == -1);
+	}
+
+	if (needs_init) {
+		if (!already_locked) {
+			cacheheader_lock_norefresh(true, &error);
+			if (error) {
+				isi_error_add_context(error,
+				    "Could not lock header during open for init");
+				goto out;
+			}
+			ch_locked = true;
+		} else {
+			ASSERT(cacheheader_lock_type_is_exclusive());
+		}
+	} else {
+		if (!already_locked) {
+			cacheheader_lock_norefresh(false, &error);
+			UFAIL_POINT_CODE(cache_open_common_fail_restart, {
+				if (!error) {
+					error = isi_system_error_new(
+					   CBM_STUB_INVALIDATE_ERROR,
+					   "Generated by failpoint to "
+					   "simulate failed invalidate "
+					   "restart during cacheheader_lock");
+				}
+			});
+
+			ON_ISI_ERROR_GOTO(out, error);
+			ch_locked = true;
+		}
+	}
+
+	ilog(IL_TRACE, "Locking cache_open_mtx for %{} (file %p)",
+	    isi_cbm_file_fmt(file_obj_), file_obj_);
+
+	pthread_mutex_lock(&file_obj_->cache_open_mtx);
+	open_mtx_locked = true;
+	ilog(IL_TRACE, "Locked cache_open_mtx for %{} (file %p)",
+	    isi_cbm_file_fmt(file_obj_), file_obj_);
+
+	/*
+	 * Now that we know we are locked, make sure we still
+	 * need the open
+	 */
+	if (is_cache_open()) {
+		goto out;
+	}
+
+	refresh_fully_cached_state(fd, &error);
+	ON_ISI_ERROR_GOTO(out, error);
+
+	/*
+	 * Open the ADS directory holding all streams.
+	 */
+	if (dir_fd_ == -1) {
+		adsd_fd = enc_openat(fd, "." , ENC_DEFAULT,
+		    O_RDONLY|O_XATTR|O_IGNORETIME);
+		if (adsd_fd < 0) {
+			error = isi_system_error_new(errno,
+			    "Opening ADS stream directory");
+			goto out;
+		}
+	} else {
+		adsd_fd = dir_fd_;
+	}
+
+reopen:
+	/*
+	 * Set flags for opening the ADS stream
+	 */
+	if (needs_init || !is_read_only()) {
+		openflags = O_RDWR|O_SYNC;
+		if (needs_init)
+			openflags |= (O_EXCL|O_CREAT);
+	} else {
+		openflags = O_RDONLY;
+	}
+
+	/*
+	 * The stream directory is now open/created.
+	 */
+	if (fd_ == -1) {
+		attr_fd = enc_openat(adsd_fd, ISI_CBM_CACHE_CACHEINFO_NAME,
+		    ENC_DEFAULT, openflags);
+		if (attr_fd < 0) {
+			if (errno != EEXIST) {
+				error = isi_system_error_new(errno,
+				    "Opening ADS  Cacheinfo with flags=0x%x",
+				    openflags);
+				goto out;
+			} else {
+				/*
+				 * We lost the race and the cache file got
+				 * created.  Go back and try openning again
+				 * without the create
+				 */
+				needs_init = false;
+				goto reopen;
+			}
+		}
+	} else {
+		attr_fd = fd_;
+	}
+
+	dir_fd_ = adsd_fd;
+	fd_ = attr_fd;
+
+	if (!needs_init) {
+		refresh_header(&error);
+		ON_ISI_ERROR_GOTO(out, error);
+	}
+
+	open_complete_ = true;
+
+out:
+
+	if (error) {
+		if (attr_fd != -1) {
+			close(attr_fd);
+			fd_ = -1;
+		}
+
+		if (adsd_fd != -1) {
+			close(adsd_fd);
+			dir_fd_ = -1;
+		}
+	}
+
+	if (open_mtx_locked) {
+		ilog(IL_TRACE, "UnLocking cache_open_mtx for %{} (file %p)",
+		    isi_cbm_file_fmt(file_obj_), file_obj_);
+		pthread_mutex_unlock(&file_obj_->cache_open_mtx);
+	}
+
+	if (error) {
+		if (ch_locked && !already_locked) {
+			/**
+			 * We got an error release the lock, if
+			 * we didn't enter the function with the lock held
+			 */
+			cacheheader_unlock(isi_error_suppress());
+		}
+
+		isi_error_handle(error, error_out);
+	} else {
+		if (!keep_locked && ch_locked) {
+			/**
+			 * If the caller does not want the lock held release
+			 * it, even if we entered the function with the lock
+			 * held
+			 */
+			cacheheader_unlock(isi_error_suppress());
+		}
+	}
+
+	return needs_init;
+}
+
+/**
+ * common routine to write the header since need in initialize and truncate
+ */
+void
+cpool_cache::write_header(struct isi_error **error_out)
+{
+	ssize_t bytes_out = 0;
+	ssize_t bytes_to_go = 0;
+	ssize_t this_write = 0;
+	struct  isi_error *error = NULL;
+	char   *buf = (char *)&cache_header_;
+
+	bytes_to_go = sizeof(cache_header_);
+	UFAIL_POINT_CODE(cpool_write_bad_head_size, {
+		bytes_to_go -= 1;
+	});
+
+	while (bytes_to_go > 0) {
+		this_write = cache_pwrite(__func__, fd_,
+		    (buf + bytes_out),
+		    bytes_to_go,
+		    (ISI_CBM_CACHE_DEFAULT_CACHEOFFSET + bytes_out),
+		    0);
+		if (this_write < 0) {
+			break;
+		}
+		bytes_to_go  -= this_write;
+		bytes_out    += this_write;
+	}
+
+	if (this_write < 0) {
+		error = isi_system_error_new(errno, "Writing Cache Header");
+		goto out;
+	} else if (bytes_out != sizeof(cache_header_)) {
+		error = isi_cbm_error_new(CBM_CACHE_HEADER_ERROR,
+		    "Invalid cache_header, size:%ld/%ld, magic:0x%lx/0x%x",
+		    bytes_out, sizeof(cache_header_),
+		    cache_header_.foot, ISI_CBM_CACHE_MAGIC);
+		goto out;
+	}
+
+	ilog(IL_TRACE,
+	    "Wrote Cache Header for lin %{}, last region %ld (%p)",
+	    lin_fmt(get_lin()), cache_header_.last_region, this);
+ out:
+	if (error)
+		isi_error_handle(error, error_out);
+}
+
+void
+cpool_cache::read_header(int fd, struct isi_error **error_out)
+{
+	struct isi_error *error = NULL;
+	ssize_t bytes_to_read;
+	ssize_t bytes_read = 0;
+	ssize_t this_read = 1;
+
+	/*
+	 * use the value passed in only for the case where the
+	 */
+	int attr_fd = (fd != -1) ? fd : fd_;
+
+	bytes_to_read = sizeof(cache_header_);
+	UFAIL_POINT_CODE(cpool_read_bad_head_size, {
+		bytes_to_read -= 1;
+	});
+	for(; bytes_read < (ssize_t)sizeof(cache_header_) && this_read;
+	    bytes_read += this_read, bytes_to_read -= this_read) {
+		this_read = pread(attr_fd, &cache_header_, bytes_to_read,
+		    ISI_CBM_CACHE_DEFAULT_CACHEOFFSET);
+		if (this_read < 0) {
+			error = isi_system_error_new(errno,
+			    "Reading Cache Header");
+			goto out;
+		}
+	}
+
+	if (bytes_read == 0 || (bytes_read == sizeof(cache_header_) &&
+	    cache_header_.foot == 0)) {
+		// if the cache header is not written yet, or the header
+		// is written due to the truncation (magic is 0),
+		// meaning we need to resume the initialization of the header
+		error = isi_cbm_error_new(CBM_CACHE_NO_HEADER,
+		    "There is no cache header found.");
+		goto out;
+	}
+
+	// the following is a real corruption:
+	if (bytes_read != sizeof(cache_header_) ||
+	    cache_header_.foot != ISI_CBM_CACHE_MAGIC) {
+		error = isi_cbm_error_new(CBM_CACHE_HEADER_ERROR,
+		    "Invalid cache_header, size:%ld/%ld, magic:0x%lx/0x%x",
+		    bytes_read, sizeof(cache_header_),
+		    cache_header_.foot, ISI_CBM_CACHE_MAGIC);
+		goto out;
+	}
+
+	if (CPOOL_CBM_CACHE_DEFAULT_VERSION != get_version()) {
+		error = isi_cbm_error_new(CBM_CACHE_VERSION_MISMATCH,
+		    "expected version %d found version %d",
+		    CPOOL_CBM_CACHE_DEFAULT_VERSION, get_version());
+		goto out;
+	}
+
+	ilog(IL_TRACE, "Loaded CacheHeader for lin %{}, last region %ld (%p)",
+	    lin_fmt(cache_header_.lin), cache_header_.last_region, this);
+
+	/* XXXegc: add test for filesize versus # regions? */
+ out:
+	if (error)
+		isi_error_handle(error, error_out);
+}
+
+/*
+ * calculate the last region from the file size, setting the value to -1 if
+ * the file size is 0.
+ */
+inline static off_t
+cache_get_last_region_from_size(size_t fsize, size_t region_size)
+{
+	return ((fsize) ? (((off_t)(fsize) - 1) / region_size) : -1);
+}
+
+void
+cpool_cache::cache_initialize_internal(size_t region_size, size_t fsize,
+    ifs_lin_t lin, struct isi_error **error_out)
+{
+	ssize_t bytes_out = 0;
+	struct isi_error *error = NULL;
+	const char  extend_data = '\0';
+	off_t extend_size;
+	int status = -1;
+
+	/*
+	 * Cacheheader is locked exclusive for init case by the open call so
+	 * we can initialize it here.
+	 * First, make sure the SF_CACHED_STUB flag is set to mark the ADS
+	 * as a cacheinfo file
+	 */
+	status = ifs_cpool_stub_ops(fd_, IFS_CPOOL_CACHE_MARK, 0,
+	    NULL, NULL, NULL);
+	if (status < 0) {
+		error = isi_cbm_error_new(CBM_CACHE_MARK_ERROR,
+		    "Failed to mark cacheinfo file: (%d) %s",
+		    errno, strerror(errno));
+		goto out;
+	}
+
+	cache_header_.version = CPOOL_CBM_CACHE_DEFAULT_VERSION;
+	cache_header_.flags = ISI_CBM_CACHE_DEFAULT_FLAGS;
+	cache_header_.lin = lin;
+	cache_header_.region_size = region_size;
+	cache_header_.last_region =
+	    cache_get_last_region_from_size(fsize, region_size);
+	cache_header_.data_offset = ISI_CBM_CACHE_DEFAULT_DATAOFFSET;
+	cache_header_.sequence = ISI_CBM_CACHE_DEFAULT_SEQUENCE;
+	cache_header_.foot = ISI_CBM_CACHE_MAGIC;
+
+	extend_size = isi_cacheinfo_offset(cache_header_.last_region);
+
+	/*
+	 * using pwrite to truncate up since ftruncate at least for
+	 * this case just seemd to d0 a truncate to 0???
+	 */
+	bytes_out = cache_pwrite(__func__, fd_, &extend_data, 1,
+	    extend_size, 0);
+	if (bytes_out < 0) {
+		error = isi_system_error_new(errno,
+		    "Initializing size of cacheinfo");
+		goto out;
+	}
+	UFAIL_POINT_CODE(cpool_init_ext_cache, {
+		bytes_out = 1;
+	});
+	if (bytes_out != 1) {
+		error = isi_cbm_error_new(CBM_CACHE_EXTEND_ERROR,
+		    "Could not extend cacheinfo during initialization, "
+		    "count %ld", bytes_out);
+		goto out;
+	}
+
+	if (fully_cached_) {
+		// if fully cached, mark all regions as already cached
+		cache_bulk_update(0, get_last_region(),
+		    ISI_CPOOL_CACHE_CACHED, &error);
+		ON_ISI_ERROR_GOTO(out, error);
+	}
+
+	UFAIL_POINT_CODE(cpool_no_cache_header, {
+	    error = isi_system_error_new(RETURN_VALUE,
+	        "Fail point cpool_no_cache_header triggered");
+	});
+	ON_ISI_ERROR_GOTO(out, error);
+
+	// write the header after the cache entries are initialized
+	write_header(&error);
+	ON_ISI_ERROR_GOTO(out, error);
+
+	ilog(IL_DEBUG,
+	    "CacheHeader initialized with last region %ld for lin %{} (%p)",
+	    cache_header_.last_region, lin_fmt(lin), this);
+
+ out:
+	isi_error_handle(error, error_out);
+}
+
+/**
+ * Given the file descriptor for the file to be cached, open the cacheinfo
+ * file, initialize the header and store it in the cacheinfo.
+ */
+void
+cpool_cache::cache_initialize_common(int fd,
+    size_t region_size, size_t fsize, ifs_lin_t lin,
+    bool already_locked, bool keep_locked,
+    struct isi_error **error_out)
+{
+	struct isi_error *error = NULL;
+	bool need_to_initialize = false;
+	bool ch_locked = already_locked;
+
+	/*
+	 * allow create to be performed, keep_locked will cause the lock
+	 * to be held in both create and non-create case.  If the flag
+	 * is true, the lock WILL be held on return, if the flag is
+	 * false or there is an error the lock will NOT be held
+	 */
+	need_to_initialize = cache_open_create(fd, ch_locked, true, &error);
+	ON_ISI_ERROR_GOTO(out, error);
+
+	ch_locked = true;
+	/*
+	 * see if the open found the header already there, if so we are done.
+	 * Note that the keep_locked option is currently used just for
+	 * testing, so doing the initialization under the shared lock
+	 * is okay...
+	 */
+	if (!need_to_initialize) {
+		ilog(IL_DEBUG,
+		    "Cache initialize found cache to already exist, just "
+		    "opened (%p)", this);
+		goto out;
+	}
+
+	cache_initialize_internal(region_size, fsize, lin, &error);
+	ON_ISI_ERROR_GOTO(out, error);
+
+	open_complete_ = true;
+
+ out:
+	if (ch_locked && !keep_locked) {
+		cacheheader_unlock(isi_error_suppress());
+		ch_locked = false;
+	}
+
+	if (error) {
+		if (ch_locked & !already_locked) {
+			cacheheader_unlock(isi_error_suppress());
+			ch_locked = false;
+		}
+		isi_error_handle(error, error_out);
+	}
+}
+
+void
+cpool_cache::cache_initialize(int fd, size_t region_size, size_t fsize,
+    ifs_lin_t lin, struct isi_error **error_out)
+{
+	cache_initialize_common(fd,
+	    region_size,
+	    fsize,
+	    lin,
+	    false, // already_locked
+	    false, // keep_locked
+	    error_out);
+}
+
+void
+cpool_cache::cache_initialize_override(int fd, size_t region_size, size_t fsize,
+    ifs_lin_t lin, struct isi_error **error_out)
+{
+	cache_initialize_common(fd,
+	    region_size,
+	    fsize,
+	    lin,
+	    false,// already_locked
+	    true, // keep_locked
+	    error_out);
+}
+
+void
+cpool_cache::cache_bulk_update(off_t start_region, off_t end_region,
+	    enum isi_cbm_cache_status status, struct isi_error **error_out)
+{
+	struct isi_error *error = NULL;
+	off_t offset = 0;
+	off_t front_region = -1;
+	off_t back_region = -1;
+	off_t bulk_start = start_region;
+	off_t bulk_end = end_region;
+	size_t bytes_to_set = 0;
+	ssize_t this_io = 0;
+	off_t start_diff = 0;
+	size_t initialize_size = 0;
+	size_t write_size = 0;
+	char status_byte = '\0';
+	char *buffer = NULL;
+	off_t i;
+	size_t j;
+	int k;
+
+	if (ISI_CBM_CACHE_ENTRIES_PER_STATUS == 1) {
+		bytes_to_set = end_region - start_region + 1;
+	} else {
+		start_diff = start_region % ISI_CBM_CACHE_ENTRIES_PER_STATUS;
+		if (start_diff) {
+			/*
+			 * if start_region is the first region to set by hand,
+			 * front_region is the last leading region to set by
+			 * hand.
+			 */
+			front_region = start_region +
+			    ISI_CBM_CACHE_ENTRIES_PER_STATUS - start_diff - 1;
+			bulk_start = front_region + 1;
+		}
+		if ((end_region + 1) % ISI_CBM_CACHE_ENTRIES_PER_STATUS) {
+			/*
+			 * if end_region is the last_region to set by hand,
+			 * back_region is the first trailing region to set by
+			 * hand.
+			 */
+			back_region = end_region -
+			    (end_region % ISI_CBM_CACHE_ENTRIES_PER_STATUS);
+			bulk_end = back_region - 1;
+		}
+		off_t bulk_regions = bulk_end - bulk_start + 1;
+		if (bulk_regions >= ISI_CBM_CACHE_ENTRIES_PER_STATUS)
+			bytes_to_set = bulk_regions /
+			    ISI_CBM_CACHE_ENTRIES_PER_STATUS;
+	}
+
+
+	/* handle front bits */
+	if (front_region != -1) {
+		for (i = start_region; i <= front_region && i <= end_region;
+		     i++) {
+			UFAIL_POINT_CODE(cbm_cache_bulk_upd_write_info_eio, {
+				error = isi_system_error_new(EIO,
+				    "Generated by failpoint before "
+				    "writing cache info for region %ld",
+				    i);
+			});
+			ON_ISI_ERROR_GOTO(out,error);
+
+			cache_info_write(i, status, &error);
+			if (error)
+				goto out;
+		}
+	}
+	/* handle the middle bits as one operation */
+	if (bytes_to_set) {
+		offset = (bulk_start / ISI_CBM_CACHE_ENTRIES_PER_STATUS) +
+		    sizeof(cache_header_);
+		/*
+		 * Limit the size of the buffer allocated to initializing the
+		 * and the single write size by the amoung specified in
+		 * ISI_CBM)CACHE_DEFAULT_BULKOP_SIZE.  The intialization
+		 * buffer will be reused for each write during the operation.
+		 */
+		initialize_size = MIN(bytes_to_set,
+		    ISI_CBM_CACHE_DEFAULT_BULKOP_SIZE);
+
+		buffer = (char *)malloc(initialize_size);
+
+		/*
+		 * use the status specified and fill a byte with that status
+		 * for buffer initialization
+		 */
+		status_byte = status;
+		for (k = 1; k < ISI_CBM_CACHE_ENTRIES_PER_STATUS; k++)
+			 status_byte =
+			 (status_byte << ISI_CBM_CACHE_BITS_PER_ENTRY) | status;
+
+		for (j = 0; j < initialize_size; j++)
+			buffer[j] = status_byte;
+
+		while (bytes_to_set > 0) {
+			/*
+			 * use the buffer until all is written.  The max
+			 * single write needs to be limited to buffer size.
+			 */
+			write_size = MIN(initialize_size, bytes_to_set);
+
+			for (;write_size > 0 && bytes_to_set > 0;
+			     write_size -= this_io, bytes_to_set -= this_io,
+				 offset += this_io) {
+
+				/*
+				 * since buffer is the same everywhere, there
+				 * is no need to adjust the starting location
+				 * in the buffer
+				 */
+				this_io = cache_pwrite(__func__, fd_, buffer,
+				    write_size, offset, 0);
+				if (this_io < 0) {
+					isi_system_error_new(errno,
+					    "Error extending cache to region "
+					    "%ld", end_region);
+					goto out;
+				}
+			}
+		}
+	}
+
+	/* handle end bits */
+	if (back_region != -1 && back_region > front_region) {
+		for (i = back_region; i <= end_region; i++) {
+			UFAIL_POINT_CODE(cbm_cache_bulk_upd_end_write_info_eio, {
+				error = isi_system_error_new(EIO,
+				    "Generated by failpoint before "
+				    "writing cache info for region %ld",
+				    i);
+			});
+			ON_ISI_ERROR_GOTO(out,error);
+
+			cache_info_write(i, status, &error);
+			if (error)
+				goto out;
+		}
+	}
+ out:
+	if (buffer)
+		free(buffer);
+	if (error)
+		isi_error_handle(error, error_out);
+}
+
+void
+cpool_cache::set_state(int state, struct isi_error **error_out)
+{
+	struct isi_error *error = NULL;
+
+	refresh_header(&error);
+	if (error) {
+		isi_error_add_context(error, "setting cacheheader state");
+		goto out;
+	}
+
+	cache_header_.flags |= state;
+	write_header(&error);
+	if (error) {
+		isi_error_add_context(error, "setting cacheheader state");
+		goto out;
+	}
+	ilog(IL_DEBUG,"CacheHeader state %d set for %{} (%p)", state,
+	    lin_fmt(get_lin()), this);
+ out:
+	if (error)
+		isi_error_handle(error, error_out);
+}
+
+void
+cpool_cache::get_sync_state(bool &dirty, bool &sync,
+     struct isi_error **error_out)
+{
+	struct isi_error *error = NULL;
+
+	refresh_header(&error);
+	if (error) {
+		isi_error_add_context(error, "refresh cache header");
+		goto out;
+	}
+	sync = (cache_header_.flags & ISI_CBM_CACHE_FLAG_SYNC) != 0;
+	dirty =  (cache_header_.flags & ISI_CBM_CACHE_FLAG_DIRTY) != 0;
+ out:
+	if (error)
+		isi_error_handle(error, error_out);
+}
+
+void
+cpool_cache::set_sync_state(bool dirty, bool sync,
+     struct isi_error **error_out)
+{
+	struct isi_error *error = NULL;
+
+	refresh_header(&error);
+	if (error) {
+		isi_error_add_context(error, "refresh cache header");
+		goto out;
+	}
+	if (sync)
+		cache_header_.flags |= ISI_CBM_CACHE_FLAG_SYNC;
+	else
+		cache_header_.flags &= ~ISI_CBM_CACHE_FLAG_SYNC;
+
+	if (dirty)
+		cache_header_.flags |= ISI_CBM_CACHE_FLAG_DIRTY;
+	else
+		cache_header_.flags &= ~ISI_CBM_CACHE_FLAG_DIRTY;
+
+	write_header(&error);
+	if (error) {
+		isi_error_add_context(error, "setting cacheheader state");
+		goto out;
+	}
+	ilog(IL_DEBUG,"CacheHeader state dirty: %d sync: %d set for %{} (%p)",
+	    dirty, sync, lin_fmt(get_lin()), this);
+ out:
+	if (error)
+		isi_error_handle(error, error_out);
+}
+
+void
+cpool_cache::get_invalidate_state(bool &cached, bool &invalidate,
+     struct isi_error **error_out)
+{
+	struct isi_error *error = NULL;
+
+	refresh_header(&error);
+	if (error) {
+		isi_error_add_context(error, "refresh cache header");
+		goto out;
+	}
+	invalidate = (cache_header_.flags &
+	    ISI_CBM_CACHE_FLAG_INVALIDATE_IP) != 0;
+	cached =  (cache_header_.flags & ISI_CBM_CACHE_FLAG_CACHED) != 0;
+ out:
+	if (error)
+		isi_error_handle(error, error_out);
+}
+
+void
+cpool_cache::set_invalidate_state(bool cached, bool invalidate,
+     struct isi_error **error_out)
+{
+	struct isi_error *error = NULL;
+
+	refresh_header(&error);
+	if (error) {
+		isi_error_add_context(error, "refresh cache header");
+		goto out;
+	}
+	if (invalidate)
+		cache_header_.flags |= ISI_CBM_CACHE_FLAG_INVALIDATE_IP;
+	else
+		cache_header_.flags &= ~ISI_CBM_CACHE_FLAG_INVALIDATE_IP;
+
+	if (cached)
+		cache_header_.flags |= ISI_CBM_CACHE_FLAG_CACHED;
+	else
+		cache_header_.flags &= ~ISI_CBM_CACHE_FLAG_CACHED;
+
+	write_header(&error);
+	if (error) {
+		isi_error_add_context(error, "setting cacheheader state");
+		goto out;
+	}
+	ilog(IL_DEBUG,
+	    "CacheHeader state cached: %d invalidate: %d set for %{} (%p)",
+	    cached, invalidate, lin_fmt(get_lin()), this);
+ out:
+	if (error)
+		isi_error_handle(error, error_out);
+}
+
+void
+cpool_cache::clear_state(int state, struct isi_error **error_out)
+{
+	struct isi_error *error = NULL;
+
+	refresh_header(&error);
+	if (error) {
+		isi_error_add_context(error, "clearing cacheheader state");
+		goto out;
+	}
+
+	cache_header_.flags &= ~state;
+	write_header(&error);
+	if (error) {
+		isi_error_add_context(error, "clearing cacheheader state");
+		goto out;
+	}
+	ilog(IL_DEBUG,"CacheHeader state %d cleared for %{} (%p)", state,
+	    lin_fmt(get_lin()), this);
+ out:
+	if (error)
+		isi_error_handle(error, error_out);
+}
+
+bool
+cpool_cache::test_state(int state, struct isi_error **error_out)
+{
+	bool   retval = ((cache_header_.flags & state) != 0);
+	return retval;
+}
+
+int
+cpool_cache::cache_reset(struct isi_error **error_out)
+{
+
+	struct isi_error *error = NULL;
+	int state = ISI_CBM_CACHE_FLAG_INVALIDATE;
+	int retval = 0;
+
+	set_state(state, &error);
+	if (error) {
+		isi_error_add_context(error, "setting cache state to %d",
+		    state);
+		goto out;
+	}
+	retval = state;
+
+	cache_bulk_update(0, get_last_region(), ISI_CPOOL_CACHE_NOTCACHED,
+	    &error);
+	if (error) {
+		isi_error_add_context(error, "Setting cache to NOT_CACHED");
+		goto out;
+	}
+ out:
+	if(error)
+		isi_error_handle(error, error_out);
+
+	return retval;
+}
+
+
+int
+cpool_cache::cache_extend(
+    size_t new_file_size, struct isi_error **error_out)
+{
+	struct isi_error *error = NULL;
+	int retval = ISI_CBM_CACHE_FLAG_NONE;
+
+	size_t	old_file_size = get_filesize(&error);
+	ON_ISI_ERROR_GOTO(out, error);
+
+	retval = cache_trunc_ext_internal(ISI_CBM_CACHE_FLAG_NONE,
+	    new_file_size, old_file_size, error_out);
+
+out:
+       if (error) {
+	       isi_error_handle(error, error_out);
+       }
+
+       return retval;
+}
+
+int
+cpool_cache::cache_truncate(
+    size_t new_file_size, struct isi_error **error_out)
+{
+	struct isi_error *error = NULL;
+	int retval = ISI_CBM_CACHE_FLAG_NONE;
+
+	size_t	old_file_size = get_filesize(&error);
+	ON_ISI_ERROR_GOTO(out, error);
+
+	retval = cache_trunc_ext_internal(ISI_CBM_CACHE_FLAG_TRUNCATE,
+	    new_file_size, old_file_size, error_out);
+
+out:
+       if (error) {
+	       isi_error_handle(error, error_out);
+       }
+
+       return retval;
+}
+
+int
+cpool_cache::cache_truncate_extend(
+    size_t new_file_size, size_t old_file_size,
+    struct isi_error **error_out)
+{
+	int retval = ISI_CBM_CACHE_FLAG_NONE;
+	retval = cache_trunc_ext_internal(ISI_CBM_CACHE_FLAG_TRUNCATE,
+	    new_file_size, old_file_size, error_out);
+	return retval;
+}
+
+int
+cpool_cache::cache_trunc_ext_internal(int state,
+    size_t new_file_size, size_t old_file_size,
+    struct isi_error **error_out)
+{
+	struct isi_error *error = NULL;
+	int retval = ISI_CBM_CACHE_FLAG_NONE;
+
+	ASSERT(is_cache_open());
+
+	bool	state_set;
+	off_t	old_cache_offset;
+	off_t	new_cache_offset;
+	off_t	old_last_region = cache_header_.last_region;
+	off_t	new_last_region =
+	    cache_get_last_region_from_size(new_file_size,
+	    cache_header_.region_size);
+
+	enum isi_cbm_cache_status fill_state =
+	    ISI_CBM_CACHE_DEFAULT_TRUNCATEUP_STATE;
+
+	if (state != ISI_CBM_CACHE_FLAG_NONE) {
+		state_set = test_state (state, &error);
+		ON_ISI_ERROR_GOTO(out, error);
+
+		if (!state_set) {
+			set_state(state, &error);
+			if (error) {
+				isi_error_add_context(error,
+				    "setting cache state to %d",
+				    state);
+				goto out;
+			}
+		}
+		retval = state;
+	}
+
+	UFAIL_POINT_CODE(cbm_cache_trunc_ext_state_eio, {
+		error = isi_system_error_new(EIO,
+		    "Generated by failpoint after checking and/or setting "
+		    "state. Current state is %d", state);
+	});
+	ON_ISI_ERROR_GOTO(out, error);
+
+	if (new_last_region < old_last_region) {
+		/*
+		 * The size of the the cached file has decreased so
+		 * adjust if needed.
+		 */
+		new_cache_offset = isi_cacheinfo_offset(new_last_region);
+		old_cache_offset = isi_cacheinfo_offset(old_last_region);
+
+		/*
+		 * cache region is compressing, before we clean it up,
+		 * make sure we record that the last region has changed.
+		 */
+		cache_header_.last_region = new_last_region;
+		write_header(&error);
+		if (error)
+			goto out;
+
+		UFAIL_POINT_CODE(cbm_cache_trunc_trunc_cache1_eio, {
+			error = isi_system_error_new(EIO,
+			    "Generated by failpoint after writing cache header"
+			    );
+		});
+		ON_ISI_ERROR_GOTO(out, error);
+
+		/*
+		 * Verify that the offset for the two "last" regions
+		 * actually changed.
+		 */
+		if (new_cache_offset != old_cache_offset) {
+			/*
+			 * truncate the cacheinfo to save space from
+			 * old size for the case of truncating the file
+			 * itself.
+			 */
+			if (ftruncate(fd_, new_cache_offset + 1) < 0) {
+				error = isi_system_error_new(errno,
+				    "Failed to shrink cacheinfo to %ld",
+				    new_cache_offset + 1);
+				goto out;
+			}
+		}
+
+		UFAIL_POINT_CODE(cbm_cache_trunc_trunc_cache2_eio, {
+			error = isi_system_error_new(EIO,
+			    "Generated by failpoint after ftruncating "
+			    "cacheinfo to %ld", new_cache_offset + 1);
+		});
+		ON_ISI_ERROR_GOTO(out, error);
+
+		/*
+		 * Now mask out rest of region in byte
+		 */
+		if (ISI_CBM_CACHE_ENTRIES_PER_STATUS > 1 &&
+		    (isi_cacheinfo_shift(new_last_region) <
+			ISI_CBM_CACHE_ENTRIES_PER_STATUS)) {
+
+			char status_byte;
+			char region_mask = (1 <<
+			    (2 * (isi_cacheinfo_shift(new_last_region) + 1)))
+				    - 1;
+
+			ssize_t bytes_io = pread(fd_, &status_byte,
+			    ISI_CBM_CACHE_READSIZE, new_cache_offset);
+
+			if (bytes_io < 0) {
+				error = isi_system_error_new(errno,
+				    "Reading truncated cacheinfo status");
+				goto out;
+			}
+
+			UFAIL_POINT_CODE(cpool_read_short_cacheinfo_1, {
+				bytes_io = ISI_CBM_CACHE_READSIZE - 1;
+			});
+			if (bytes_io < ISI_CBM_CACHE_READSIZE) {
+				error = isi_cbm_error_new(
+				    CBM_CACHEINFO_SIZE_ERROR,
+				    "Short read for truncated cacheinfo, "
+				    "bytes: %ld/%d",
+				    bytes_io, ISI_CBM_CACHE_READSIZE);
+				goto out;
+			}
+
+			status_byte &= region_mask;
+
+			if (new_file_size % cache_header_.region_size) {
+				// the new last region is partially truncated
+				// down, mark it dirty.
+				int shift =
+				    isi_cacheinfo_shift(new_last_region) *
+				    ISI_CBM_CACHE_BITS_PER_ENTRY;
+				char mask = ISI_CBM_CACHE_ENTRYMASK << shift;
+				char shifted_status = (ISI_CPOOL_CACHE_DIRTY
+				    << shift) & mask;
+				status_byte = (status_byte & ~mask) |
+				    shifted_status;
+			}
+
+			bytes_io = cache_pwrite(__func__, fd_, &status_byte,
+			    ISI_CBM_CACHE_READSIZE, new_cache_offset, 0);
+
+			if (bytes_io < 0) {
+				error = isi_system_error_new(errno,
+				    "Writing truncated cacheinfo status");
+				goto out;
+			}
+
+			UFAIL_POINT_CODE(cpool_write_short_cacheinfo_1, {
+				bytes_io = ISI_CBM_CACHE_READSIZE - 1;
+			});
+			if (bytes_io < ISI_CBM_CACHE_READSIZE) {
+				error = isi_cbm_error_new(
+				    CBM_CACHEINFO_SIZE_ERROR,
+				    "Short write for truncated cacheinfo, "
+				    "bytes: %ld/%d",
+				    bytes_io, ISI_CBM_CACHE_READSIZE);
+			}
+			ON_ISI_ERROR_GOTO(out,error);
+
+		}
+		ilog(IL_DEBUG,
+		    "Cache truncated from region %ld to %ld "
+		    "for size %ld lin %{} (%p)",
+		    old_last_region, new_last_region, new_file_size,
+		    lin_fmt(get_lin()), this);
+	} else if (new_last_region > old_last_region) {
+		/*
+		 * This will explicitly extend the cache to
+		 * the proper size.  This should avoid read
+		 * errors when trying to look at uncached
+		 * regions after a file has been extended.
+		 * Any new regions added in these new bytes
+		 * will be autozero'd (uncached state) by object-reuse
+		 * characteristics of the filesystem.  And previously
+		 * used regions that are in the last byte of the old
+		 * version will be 0 from the initial use
+		 * (object-reuse) or cleared above in the case of a
+		 * previous truncate down.
+		 */
+		new_cache_offset = isi_cacheinfo_offset(new_last_region);
+
+		/*
+		 * on a file extend, treat new regions as uncached by
+		 * simply changing the size of the cacheinfo and
+		 * taking advantage of the uncached state as being
+		 * 0).  This works well for initial cache creation.
+		 * We do this for all extends of the cache even when the
+		 * status is going to be set to something other than
+		 * uncached.  This allows the standard cache_info_write to
+		 * work for updating partial records, should they exist.
+		 */
+		if (ftruncate(fd_, new_cache_offset + 1) < 0) {
+			error = isi_system_error_new(errno,
+			    "Failed to extend cacheinfo");
+			goto out;
+		}
+
+		UFAIL_POINT_CODE(cbm_cache_trunc_ext_cache1_eio, {
+			error = isi_system_error_new(EIO,
+			    "Generated by failpoint after ftruncating "
+			    "cacheinfo to %ld", new_cache_offset);
+		});
+		ON_ISI_ERROR_GOTO(out, error);
+
+		/*
+		 * If the default cache state for blocks being added due to
+		 * extension is not specified as NOTCACHED, then fill in the
+		 * correct status.  The bulk update is used here to try to
+		 * minimize the number of writes that need to be done to a max
+		 * of (2 * ISI_CBM_CACHE_ENTRIES_PER_STATUS - 1) + 1 rather
+		 * than a write for each region added.
+		 */
+		off_t start_region = cache_header_.last_region + (
+		    (old_file_size % cache_header_.region_size) != 0 ? 0 : 1);
+
+		if (fill_state != ISI_CPOOL_CACHE_NOTCACHED) {
+			cache_bulk_update(start_region,
+			    new_last_region, fill_state, &error);
+			if (error)
+				goto out;
+		}
+
+		UFAIL_POINT_CODE(cbm_cache_trunc_ext_cache2_eio, {
+			error = isi_system_error_new(EIO,
+			    "Generated by failpoint after bulk updating "
+			    "cacheinfo");
+		});
+		ON_ISI_ERROR_GOTO(out, error);
+
+		/*
+		 * cache region extended, record the new last region
+		 * in the header.
+		 */
+		cache_header_.last_region = new_last_region;
+		write_header(&error);
+		if (error)
+			goto out;
+
+		UFAIL_POINT_CODE(cbm_cache_trunc_ext_cache3_eio, {
+			error = isi_system_error_new(EIO,
+			    "Generated by failpoint after writing "
+			    "cache header");
+		});
+		ON_ISI_ERROR_GOTO(out, error);
+
+		ilog(IL_DEBUG,
+		    "Cache extended from region %ld to %ld "
+		    "for size %ld lin %{} (%p)",
+		    old_last_region, new_last_region, new_file_size,
+		    lin_fmt(get_lin()), this);
+	} else {
+		/*
+		 * Well the last region didn't change so just check the file
+		 * size to see if we need to update that.
+		 */
+		UFAIL_POINT_CODE(cbm_cache_trunc_ext_write_info_eio, {
+			error = isi_system_error_new(EIO,
+			    "Generated by failpoint before "
+			    "writing cache info for new last region %ld",
+			    new_last_region);
+		});
+		ON_ISI_ERROR_GOTO(out, error);
+
+		cache_info_write(new_last_region,
+		    ISI_CPOOL_CACHE_DIRTY, &error);
+		ON_ISI_ERROR_GOTO(out, error);
+
+		ilog(IL_DEBUG,
+		    "Cache size change to %ld last region %ld for lin %{} (%p)",
+		    new_file_size, old_last_region,
+		    lin_fmt(cache_header_.lin), this);
+	}
+
+ out:
+	if (error)
+		isi_error_handle(error, error_out);
+
+	return retval;
+}
+
+void
+cpool_cache::cache_close()
+{
+	ilog(IL_DEBUG, "Closing cache for %{} (%p)", lin_fmt(get_lin()), this);
+
+	if (fd_ != -1) {
+		close(fd_);
+		fd_ = -1;
+	}
+	if (dir_fd_ != -1) {
+		close(dir_fd_);
+		dir_fd_ = -1;
+	}
+	open_complete_ = false;
+}
+
+void
+cpool_cache::cache_info_read(off_t region, enum isi_cbm_cache_status *status,
+    struct isi_error **error_out)
+{
+	ASSERT(error_out && *error_out == NULL);
+	ASSERT(is_cache_open());
+
+	char status_byte;
+	struct isi_error *error = NULL;
+	off_t offset = isi_cacheinfo_offset(region);
+	int shift = isi_cacheinfo_shift(region) * ISI_CBM_CACHE_BITS_PER_ENTRY;
+	ssize_t planned_bytes = ISI_CBM_CACHE_READSIZE;
+
+	ssize_t bytes_read = pread(fd_, &status_byte, planned_bytes, offset);
+
+	if (bytes_read < 0) {
+		error = isi_system_error_new(errno, "Reading cacheinfo");
+		goto out;
+	}
+
+	UFAIL_POINT_CODE(cpool_read_short_cacheinfo_2, {
+		ilog(IL_DEBUG,
+		    "failpoint setting bytes read from %lld to %lld",
+		    bytes_read, (planned_bytes - 1));
+		bytes_read = planned_bytes - 1;
+	});
+	if (bytes_read != planned_bytes) {
+		error = isi_cbm_error_new(CBM_CACHEINFO_SIZE_ERROR,
+		    "Short read for cacheinfo region %lld, offset %lld, "
+		    "bytes: %llu/%llu",
+		    region, offset, bytes_read, planned_bytes);
+		goto out;
+	}
+
+	*status = (enum isi_cbm_cache_status)((status_byte >> shift) &
+	    ISI_CBM_CACHE_ENTRYMASK);
+ out:
+	if (error)
+		isi_error_handle(error, error_out);
+}
+
+void
+cpool_cache::cache_info_write(off_t region, enum isi_cbm_cache_status status,
+    struct isi_error **error_out)
+{
+	ASSERT(error_out && *error_out == NULL);
+	ASSERT(is_cache_open());
+
+	char status_byte;
+	char mask;
+	char shifted_status;
+	struct isi_error *error = NULL;
+	off_t offset = isi_cacheinfo_offset(region);
+	int shift = isi_cacheinfo_shift(region) * ISI_CBM_CACHE_BITS_PER_ENTRY;
+
+	ssize_t bytes_io = pread(fd_, &status_byte,
+	    ISI_CBM_CACHE_READSIZE, offset);
+
+	if (bytes_io < 0) {
+		error = isi_system_error_new(errno,
+		    "Reading cacheinfo for write");
+		goto out;
+	}
+
+	UFAIL_POINT_CODE(cpool_read_short_cacheinfo_3, {
+		bytes_io = ISI_CBM_CACHE_READSIZE - 1;
+	});
+	if (bytes_io != ISI_CBM_CACHE_READSIZE) {
+		error = isi_cbm_error_new(CBM_CACHEINFO_SIZE_ERROR,
+		    "Short read (before write) for cacheinfo, bytes: %ld/%d",
+		    bytes_io, ISI_CBM_CACHE_READSIZE);
+		goto out;
+	}
+
+	mask = ISI_CBM_CACHE_ENTRYMASK << shift;
+	shifted_status = (status << shift) & mask;
+	status_byte = (status_byte & ~mask) | shifted_status;
+
+	bytes_io = cache_pwrite(__func__, fd_, &status_byte,
+	    ISI_CBM_CACHE_READSIZE, offset, 0);
+
+	if (bytes_io < 0) {
+		error = isi_system_error_new(errno,
+		    "Writing cacheinfo status");
+		goto out;
+	}
+
+	UFAIL_POINT_CODE(cpool_write_short_cacheinfo_2, {
+		bytes_io = ISI_CBM_CACHE_READSIZE - 1;
+	});
+	if (bytes_io != ISI_CBM_CACHE_READSIZE) {
+		error = isi_cbm_error_new(CBM_CACHEINFO_SIZE_ERROR,
+		    "Short write for cacheinfo, bytes: %ld/%d",
+		    bytes_io, ISI_CBM_CACHE_READSIZE);
+		goto out;
+	}
+
+ out:
+	if (error)
+		isi_error_handle(error, error_out);
+}
+
+/**
+ * Walk the cacheinfo map looking for picking out a sequence of
+ * regions that have the same status as the previon region and return
+ * the last region that matches that status.  If a mask is specified,
+ * return only a range that matches the status represented by the
+ * mask. (NB: mask not yet implemented XXXegcXXX)
+ */
+void
+cpool_cache::get_status_range(off_t *start_region, off_t *end_region,
+    int mask, enum isi_cbm_cache_status *status, struct isi_error **error_out)
+{
+	ASSERT(error_out && *error_out == NULL);
+	ASSERT(is_cache_open());
+
+	struct isi_error *error = NULL;
+	off_t next_region;
+	enum isi_cbm_cache_status next_status;
+	bool start_valid = false;
+
+	if (!mask) {
+		/* get status of first region */
+		cache_info_read(*start_region, status, &error);
+		if (error) {
+			isi_error_handle(error, error_out);
+			goto out;
+		}
+		start_valid = true;
+	} else {
+		/*
+		 * Start looking through the regions for something that
+		 * matches the mask.
+		 */
+		for (next_region = *start_region;
+		     next_region <= cache_header_.last_region;
+		     next_region++) {
+			cache_info_read(next_region, &next_status, &error);
+			if (error) {
+				isi_error_handle(error, error_out);
+				goto out;
+			}
+			/*
+			 * Find the first region that has a status that
+			 * matches something in the input mask.  Use this
+			 * as the start point.
+			 */
+			if (mask & isi_cbm_cache_mask_map[next_status]) {
+				ilog(IL_DEBUG, "Found mask match "
+				    "start region %lld, mask %d, "
+				    "region %lld, status %d",
+				    *start_region, mask,
+				    next_region, next_status);
+				*start_region = next_region;
+				*status = next_status;
+				start_valid = true;
+				break;
+			}
+		}
+	}
+
+	UFAIL_POINT_CODE(cpool_range_start_invalid, {
+		start_valid = false;
+	});
+	if (!start_valid) {
+		error = isi_cbm_error_new(CBM_NO_REGION_ERROR,
+		    "No regions found starting at %ld for mask %d",
+		    *start_region, mask);
+		isi_error_handle(error, error_out);
+		goto out;
+	}
+
+	*end_region = *start_region;
+	next_region = *start_region;
+	next_status = *status;
+
+	/*
+	 * Start looking through the regions starting right after the
+	 * value we just found and break when the status changes or we
+	 * hit the end of the cacheinfo.
+	 */
+	for (next_region = *start_region + 1;
+	     next_region <= cache_header_.last_region;
+	     next_region++) {
+		cache_info_read(next_region, &next_status, &error);
+		if (error) {
+			isi_error_handle(error, error_out);
+			goto out;
+		}
+		/*
+		 * If the status for this just read region is
+		 * different from the past, we are done now.
+		 */
+		if (next_status != *status) {
+			ilog(IL_DEBUG, "Found status mismatch "
+			    "start region %lld, input status %d, "
+			    "region %lld, status %d",
+			    *start_region, *status, next_region, next_status);
+			next_region--;
+			break;
+		}
+	}
+
+	if (next_region == (cache_header_.last_region + 1))
+		*end_region = cache_header_.last_region;
+	else
+		*end_region = next_region;
+ out:
+	error = NULL;
+}
+
+MAKE_ENUM_FMT(isi_cbm_cache_status, enum isi_cbm_cache_status,
+    ENUM_VAL(ISI_CPOOL_CACHE_NOTCACHED, 	"Not Cached"),
+    ENUM_VAL(ISI_CPOOL_CACHE_CACHED,		"Cached"),
+    ENUM_VAL(ISI_CPOOL_CACHE_DIRTY,		"Dirty"),
+    ENUM_VAL(ISI_CPOOL_CACHE_INPROGRESS,	"In-Progress"),
+);
+
+
+void
+dump_flags(int flags)
+{
+	struct fmt FMT_INIT_CLEAN(str);
+	uint32_t count;
+
+	for (count = 0; count < CPOOL_CACHE_MAX_FLAG_VALUES; count++) {
+		if ((flags >> count) & 0x1)
+			fmt_print(&str, "%s ", cpool_cache_flags_val[count]);
+	}
+	printf("%s", fmt_string(&str));
+}
+
+void
+cpool_cache::dump(bool dump_status, struct isi_error **error_out)
+{
+	ASSERT(error_out && *error_out == NULL);
+	ASSERT(is_cache_open());
+
+	off_t region, end_region;
+	enum isi_cbm_cache_status status;
+	struct isi_error *error = NULL;
+	off_t filesize = get_filesize(isi_error_suppress());
+
+	/* print header */
+	printf("Version:\t%d\n", cache_header_.version);
+	printf("Flags:\t\t0x%0x\n", cache_header_.flags);
+	if (cache_header_.flags) {
+		printf("\t\t");
+		dump_flags(cache_header_.flags);
+		printf("\n");
+	}
+	printf("Lin:\t\t0x%08lx\n", cache_header_.lin);
+	printf("File size:\t%ld\n", filesize);
+	printf("Range Size:\t%ld\n", cache_header_.region_size);
+	printf("Data Offset:\t%ld\n", cache_header_.data_offset);
+	printf("Last Region:\t%ld\n", cache_header_.last_region);
+	printf("Sequence:\t%ld\n", cache_header_.sequence);
+	printf("Foot:\t\t0x%0lx\n", cache_header_.foot);
+
+	if (!dump_status)
+		goto out;
+
+	/* print status information for regions */
+	for (region = 0; region <= cache_header_.last_region; ) {
+		struct fmt FMT_INIT_CLEAN(fmt_status);
+
+		get_status_range(&region, &end_region, 0, &status, &error);
+		if (error)
+			goto out;
+
+		fmt_print(&fmt_status, "%{}", isi_cbm_cache_status_fmt(status));
+		printf("Start region:\t%ld\tEnd Region:\t%ld\tStatus:\t%s\n",
+		    region, end_region, fmt_string(&fmt_status));
+		region = end_region + 1;
+	}
+ out:
+	if (error)
+		isi_error_handle(error, error_out);
+}
+
+bool
+cpool_cache::convert_bytes_to_regions(off_t offset, size_t length,
+    off_t *start, off_t *end, struct isi_error **error_out)
+{
+	bool retval = false;
+	off_t st;
+	off_t ed;
+	struct isi_error *error = NULL;
+	off_t filesize = get_filesize(&error);
+	ON_ISI_ERROR_GOTO(out, error);
+
+	*start = -1;
+	*end = -1;
+
+	if (!is_cache_open())
+		goto out;
+
+	if (offset < 0 || (offset + (off_t)length) > filesize)
+		goto out;
+
+	st = offset / get_regionsize();
+	ed = (offset + length - 1) / get_regionsize();
+
+	if (!is_valid_region(st))
+		goto out;
+
+	*start = st;
+
+	if (!is_valid_region(ed))
+		goto out;
+
+	*end = ed;
+	retval = true;
+ out:
+	isi_error_handle(error, error_out);
+	return retval;
+}
+
+bool
+cpool_cache::convert_regions_to_bytes(off_t start, off_t end,
+    off_t *offset, size_t *length, struct isi_error **error_out)
+{
+	*offset = -1;
+	*length = -1;
+	bool retval = false;
+	struct isi_error *error = NULL;
+
+	if (!is_cache_open())
+		goto out;
+
+	if (!is_valid_region(start))
+		goto out;
+
+	*offset = start * get_regionsize();
+
+	if (!is_valid_region(end) || end < start)
+		goto out;
+
+	if (end != get_last_region())
+		*length = ((end + 1) * get_regionsize()) - *offset;
+	else {
+		*length = get_filesize(&error) - *offset;
+		ON_ISI_ERROR_GOTO(out, error);
+	}
+
+	retval = true;
+
+ out:
+	isi_error_handle(error, error_out);
+	return retval;
+}
+
+void
+cpool_cache::cacheheader_lock(bool exclusive, struct isi_error **error_out)
+{
+	cacheheader_lock_common(exclusive, true,
+	    ISI_CBM_CACHE_FLAG_NONE, error_out);
+}
+
+void
+cpool_cache::cacheheader_lock_extended(bool exclusive,
+    int function, struct isi_error **error_out)
+{
+	cacheheader_lock_common(exclusive, true,
+	    function, error_out);
+}
+
+void
+cpool_cache::cacheheader_lock_norefresh(bool exclusive,
+    struct isi_error **error_out)
+{
+	cacheheader_lock_common(exclusive, false,
+	    ISI_CBM_CACHE_FLAG_NONE, error_out);
+}
+
+void
+cpool_cache::cacheheader_lock_common(bool exclusive, bool refresh,
+    int function, struct isi_error **error_out)
+{
+	struct isi_error *error = NULL;
+	struct flock ch_flock;
+	bool ch_locked		= false;
+	bool state_set 		= false;
+	bool downgrade		= false;
+	int flock_status 	= 0;
+	off_t filesize		= -1;
+
+	if ((file_obj_== NULL) || (file_obj_->fd == -1)) {
+		error = isi_cbm_error_new(CBM_CACHEINFO_ERROR,
+		    "Cannot lock cache header for lin %{}, "
+		    "File object is not open (%p)",
+		    lin_fmt(get_lin()), this);
+		goto out;
+	}
+
+	ch_flock.l_start = ISI_CBM_CACHE_HEADER_LOCK_OFFSET;
+	ch_flock.l_len = 1;
+	ch_flock.l_pid = 0;
+	ch_flock.l_whence = SEEK_SET;
+	ch_flock.l_sysid = 0;
+	ch_flock.l_type = exclusive ? CPOOL_LK_X : CPOOL_LK_SR;
+
+	ilog(IL_TRACE, "Trying to lock CacheHeader in %s mode "
+	    "function: %d, refresh: %d "
+	    "for lin %{} (%p)",
+	    exclusive?"Exclusive":"Shared", function, refresh,
+	    lin_fmt(get_lin()), this);
+
+	flock_status = ifs_cpool_flock(file_obj_->fd, LOCK_DOMAIN_CPOOL_CACHE,
+	    F_SETLK, &ch_flock, F_SETLKW);
+	if (flock_status) {
+		error = isi_system_error_new(errno,
+		    "Failed to lock cacheheader %s for lin %{} (%p)",
+		    exclusive?"Exclusive":"Shared",
+		    lin_fmt(get_lin()), this);
+		goto out;
+	}
+	ch_locked = true;
+	ch_lock_type_ = (cpool_lock_type)ch_flock.l_type;
+
+	ilog(IL_TRACE, "Locked CacheHeader in %s mode "
+	    "function: %d, refresh: %d "
+	    "for lin %{} (%p)",
+	    exclusive?"Exclusive":"Shared", function, refresh,
+	    lin_fmt(get_lin()), this);
+
+	/*
+	 * Make sure that if any invalidation was partially done during
+	 * archive, it is finished here before any IO can be done.
+	 */
+	check_invalidate(&error);
+	ON_ISI_ERROR_GOTO(out, error);
+
+	if (refresh) {
+		refresh_fully_cached_state(file_obj_->fd, &error);
+		ON_ISI_ERROR_GOTO(out, error);
+	}
+
+	/*
+	 * header is locked so if we have the ADS open
+	 * refresh the header now to be sure we have the
+	 * most recent information
+	 */
+	if ((refresh) && (fd_ != -1)) {
+		do {
+			refresh_header(&error);
+			if (error) {
+				if (is_read_only() || !isi_cbm_error_is_a(
+				    error, CBM_CACHE_NO_HEADER)) {
+					// if read-only, nothing can be done,
+					// bail
+					ON_ISI_ERROR_GOTO(out, error);
+				}
+
+				ilog(IL_DEBUG, "No cache header found, resume "
+				    "initialization for "
+				    "for lin %{} (%p) exclusive: %s, error: "
+				    "%#{}",
+				    lin_fmt(get_lin()), this,
+				    exclusive?"Exclusive":"Shared",
+				    isi_error_fmt(error));
+
+				isi_error_free(error);
+				error = NULL;
+
+				if (!exclusive) {
+					cacheheader_upgrade_to_exlock(
+					    ch_locked, &error);
+					ON_ISI_ERROR_GOTO(out, error);
+
+					downgrade = true;
+					exclusive = true;
+					continue; // retry
+				}
+
+				// now we have the exclusive
+				// lock, and the condition
+				// remains, correct it.
+				struct stat buf;
+				if (fstat(file_obj_->fd, &buf) == -1) {
+					error = isi_system_error_new(
+					    errno,
+					    "Cannot stat file %{} "
+					    "for cache initiailize",
+					    isi_cbm_file_fmt(file_obj_));
+					goto out;
+				}
+
+				cache_initialize_internal(
+				    file_obj_->mapinfo->get_readsize(),
+				    buf.st_size,
+				    file_obj_->lin, &error);
+				ON_ISI_ERROR_GOTO(out, error);
+			}
+			break;
+		} while (true);
+	}
+
+	/**
+	 * make sure we do not have a truncate or invalidate already
+	 * in progress.  If we do then the operation must have died,
+	 * so complete it here then continue with what we were doing.
+	 */
+	state_set = test_state(
+	    (ISI_CBM_CACHE_FLAG_INVALIDATE |
+	     ISI_CBM_CACHE_FLAG_TRUNCATE),
+	    &error);
+	if (state_set) {
+		/**
+		 * One, or both, states are set. Bail out if we are
+		 * read only.  Else make, sure we have
+		 * the lock exclusive and then finish what was begun
+		 * elsewhere.
+		 */
+		if (is_read_only()) {
+			ilog(IL_DEBUG, "Wont complete in progress truncate or"
+			    "invalidate for lin %{} since we(%p) are read-only",
+			    lin_fmt(get_lin()), this);
+			goto out;
+		}
+
+		if (!exclusive) {
+			cacheheader_upgrade_to_exlock(ch_locked, &error);
+			ON_ISI_ERROR_GOTO(out, error);
+
+			downgrade = true;
+			/*
+			 * we released and relocked the header
+			 * so refresh to be sure we have the
+			 * most recent information
+			 */
+			if (refresh) {
+				refresh_header(&error);
+				if (error) {
+					goto out;
+				}
+			}
+		}
+	}
+
+	/**
+	 * retest the state after getting the correct lock and then
+	 * finish the operation if the in progress flag is still set.
+	 */
+	state_set = test_state(
+	    ISI_CBM_CACHE_FLAG_TRUNCATE,
+	    &error);
+	if (state_set && (function != ISI_CBM_CACHE_FLAG_TRUNCATE)) {
+		/**
+		 * truncate in progress is set, and this call to the
+		 * did not come from a truncate, so complete it here
+		 */
+		ilog(IL_DEBUG, "Truncate in progress found set "
+		    "for lin %{} (%p)",
+		    lin_fmt(get_lin()), this);
+		/**
+		 * make sure the cache is open
+		 */
+		struct isi_cbm_file * file_obj = get_file_obj();
+		if (!file_obj->cacheinfo->is_cache_open()) {
+			file_obj->cacheinfo->cache_open(file_obj->fd,
+			    true, true, &error);
+			if (error) {
+				isi_error_add_context(error,
+				    "failed to open cache for lin %{} (%p)",
+				    lin_fmt(get_lin()), this);
+				goto out;
+			}
+		}
+
+		filesize = get_filesize(&error);
+		ON_ISI_ERROR_GOTO(out, error);
+
+		ilog(IL_DEBUG,
+		     "Calling truncate_restart for %{} "
+		     "with filesize %llu",
+		    isi_cbm_file_fmt(file_obj),
+		    filesize);
+
+		isi_cbm_file_ftruncate_restart(
+		    get_file_obj(),
+		    filesize,
+		    this,
+		    &error);
+		if (error) {
+			goto out;
+		}
+	}
+
+	state_set = test_state(
+	    ISI_CBM_CACHE_FLAG_INVALIDATE,
+	    &error);
+	if (state_set && (function != ISI_CBM_CACHE_FLAG_INVALIDATE)) {
+		/**
+		 * invalidate in progress is set, and this call
+		 * did not come from an invalidate, so complete it here
+		 */
+		ilog(IL_DEBUG, "Invalidate in progress found set "
+		    "for lin %{} (%p)",
+		    lin_fmt(get_lin()), this);
+		/**
+		 * make sure the cache is open
+		 */
+		ASSERT(get_file_obj()->cacheinfo->is_cache_open());
+		isi_cbm_invalidate_cache_restart(
+		    get_file_obj(),
+		    get_lin(), this, true, &error);
+		if (error) {
+			goto out;
+		}
+	}
+
+	if (downgrade) {
+		ch_flock.l_type = CPOOL_LK_SR;
+		flock_status = ifs_cpool_flock(file_obj_->fd,
+		    LOCK_DOMAIN_CPOOL_CACHE,
+		    F_CONVERTLK, &ch_flock, 0);
+		if (flock_status) {
+			//we assert if downgrade the lock fails
+			//due to errors other then interrupt in
+			//ifs_cpool_flock.
+			//Hence, downgrade fails here iff EINTR.
+			//At this point, we should own the original
+			//execlusive lock for which we should unlock it
+			//before we exit.
+			error = isi_system_error_new(errno,
+			    "failed to downgrade cacheheader lock "
+			    "for lin %{} (%p) due to errno %d",
+			    lin_fmt(get_lin()), this, errno);
+			goto out;
+		}
+		ch_lock_type_ = (cpool_lock_type)ch_flock.l_type;
+	}
+
+#ifdef CHECK_LOCK_INFO
+	struct flock tmp_flock;
+	if (ifs_cpool_flock(file_obj_->fd, LOCK_DOMAIN_CPOOL_CACHE, F_GETLK,
+		&tmp_flock, 0)) {
+		error = isi_system_error_new(errno,
+		    "Failed to get lock info for cacheheader debugging "
+		    "for lin %{}", lin_fmt(get_lin()));
+		goto out;
+	}
+	ilog(IL_TRACE, "CacheHeader lock results: off %ld, len %ld, type %{}",
+	    tmp_flock.l_start, tmp_flock.l_len,
+	    cache_cpool_lock_type_fmt((enum cpool_lock_type)tmp_flock.l_type));
+#endif
+
+ out:
+	if (error) {
+		if (ch_locked) {
+			ifs_cpool_flock(file_obj_->fd,
+			    LOCK_DOMAIN_CPOOL_CACHE, F_UNLCK,
+			    &ch_flock, 0);
+			ch_locked = false;
+			ilog(IL_DEBUG,
+			    "Unlocked CacheHeader due to error for lin %{} (%p)",
+			    lin_fmt(get_lin()), this);
+
+		}
+		isi_error_handle(error,error_out);
+	}
+}
+
+void
+cpool_cache::cacheheader_unlock(struct isi_error **error_out)
+{
+	struct isi_error *error = NULL;
+	struct flock ch_flock;
+
+	ch_flock.l_start = ISI_CBM_CACHE_HEADER_LOCK_OFFSET;
+	ch_flock.l_len = 1;
+	ch_flock.l_pid = 0;
+	ch_flock.l_type = CPOOL_LK_SR;
+	ch_flock.l_whence = SEEK_SET;
+	ch_flock.l_sysid = 0;
+
+	ilog(IL_TRACE, "Unlocking CacheHeader for lin %{} (%p)",
+	    lin_fmt(get_lin()), this);
+	if (ifs_cpool_flock(file_obj_->fd,
+	    LOCK_DOMAIN_CPOOL_CACHE, F_UNLCK,
+		&ch_flock, 0)) {
+		error = isi_system_error_new(errno,
+		    "Failed to unlock cacheheader for lin %{}",
+		    lin_fmt(get_lin()));
+		goto out;
+	}
+
+	ilog(IL_TRACE, "Unlocked CacheHeader for lin %{} (%p)",
+	    lin_fmt(get_lin()), this);
+ out:
+	if (error)
+		isi_error_handle(error, error_out);
+}
+
+void
+cpool_cache::cacheheader_downgrade_to_shlock(struct isi_error **error_out)
+{
+	struct isi_error *error = NULL;
+	struct flock ch_flock;
+
+	ch_flock.l_start = ISI_CBM_CACHE_HEADER_LOCK_OFFSET;
+	ch_flock.l_len = 1;
+	ch_flock.l_pid = 0;
+	ch_flock.l_type = CPOOL_LK_SR;
+	ch_flock.l_whence = SEEK_SET;
+	ch_flock.l_sysid = 0;
+
+	ilog(IL_TRACE, "Converting CacheHeader lock for lin %{} (%p) from "
+	    "exclusive to shared-read.", lin_fmt(get_lin()), this);
+	if (ifs_cpool_flock(file_obj_->fd, LOCK_DOMAIN_CPOOL_CACHE,
+	    F_CONVERTLK, &ch_flock, 0)) {
+		error = isi_system_error_new(errno,
+		    "Failed to convert cacheheader lock for lin %{} from "
+		    "exclusive to shared-read.", lin_fmt(get_lin()));
+		goto out;
+	}
+
+	ilog(IL_TRACE, "Converted CacheHeader lock for lin %{} (%p) from "
+	    "exclusive to shared-read.", lin_fmt(get_lin()), this);
+
+	ch_lock_type_ = (cpool_lock_type)ch_flock.l_type;
+ out:
+	if (error)
+		isi_error_handle(error, error_out);
+}
+
+
+void
+cpool_cache::cacheheader_upgrade_to_exlock(bool &locked,
+    struct isi_error **error_out)
+{
+	struct isi_error *error = NULL;
+	struct flock ch_flock;
+
+	ch_flock.l_start = ISI_CBM_CACHE_HEADER_LOCK_OFFSET;
+	ch_flock.l_len = 1;
+	ch_flock.l_pid = 0;
+	ch_flock.l_type = CPOOL_LK_SR;
+	ch_flock.l_whence = SEEK_SET;
+	ch_flock.l_sysid = 0;
+
+	ilog(IL_TRACE, "Converting CacheHeader lock for lin %{} (%p) from "
+	    "shared-read to exclusive.", lin_fmt(get_lin()), this);
+	if (ifs_cpool_flock(file_obj_->fd, LOCK_DOMAIN_CPOOL_CACHE, F_UNLCK,
+	    &ch_flock, 0)) {
+		error = isi_system_error_new(errno,
+		    "Failed to unlock cacheheader lock for lin %{}",
+		    lin_fmt(get_lin()));
+		goto out;
+	}
+
+	locked = false;
+	ilog(IL_TRACE, "Converting cacheheader lock to exclusive"
+	    " for lin %{} (%p)",
+	    lin_fmt(get_lin()), this);
+
+	ch_flock.l_type = CPOOL_LK_X;
+
+	if (ifs_cpool_flock(file_obj_->fd, LOCK_DOMAIN_CPOOL_CACHE, F_SETLK,
+	    &ch_flock, F_SETLKW)) {
+		error = isi_system_error_new(errno,
+		    "Failed to lock cacheheader %s "
+		    "for lin %{} (%p)",
+		    "Exclusive", lin_fmt(get_lin()),
+		    this);
+		goto out;
+	}
+
+	ilog(IL_TRACE, "Converted CacheHeader lock for lin %{} (%p) from "
+	    "shared-read to exclusive.", lin_fmt(get_lin()), this);
+	locked = true;
+	ch_lock_type_ = (cpool_lock_type)ch_flock.l_type;
+
+ out:
+	if (error)
+		isi_error_handle(error, error_out);
+}
+
+void
+cpool_cache::cache_lock_region(size_t region, bool exclusive,
+    struct isi_error **error_out)
+{
+	cache_lock_range(region, region, exclusive, error_out);
+}
+
+void
+cpool_cache::cache_lock_range(
+    size_t start_region,
+    size_t end_region,
+    bool exclusive,
+    struct isi_error **error_out)
+{
+	struct flock region_flock;
+	struct isi_error *error = NULL;
+	size_t start_offset = ISI_CBM_CACHE_LOCK_OFFSET(start_region);
+	size_t end_offset   = ISI_CBM_CACHE_LOCK_OFFSET(end_region);
+
+	if (start_region > end_region) {
+		error = isi_system_error_new(EINVAL,
+		    "Invalid lock cache request"
+		    "range %ld-%ld (offset %ld-%ld) for lin %{}",
+		    start_region, end_region, start_offset, end_offset,
+		    lin_fmt(get_lin()));
+		goto out;
+	}
+
+	region_flock.l_start = start_offset;
+	region_flock.l_len = end_offset - start_offset + 1;
+	region_flock.l_pid = 0;
+	region_flock.l_type = exclusive ? CPOOL_LK_X : CPOOL_LK_SR;
+	region_flock.l_whence = SEEK_SET;
+	region_flock.l_sysid = 0;
+
+	ilog(IL_TRACE,
+	    "Trying to lock range %ld-%ld (offset %ld-%ld) "
+	    "in %s mode for lin%{} (%p)",
+	    start_region, end_region, start_offset, end_offset,
+	    exclusive?"Exclusive":"Shared", lin_fmt(get_lin()), this);
+
+	if (ifs_cpool_flock(fd_, LOCK_DOMAIN_CPOOL_CACHE, F_SETLK,
+		&region_flock, F_SETLKW)) {
+		error = isi_system_error_new(errno,
+		    "Failed to lock cache range  %ld-%ld (offset %ld-%ld) "
+		    "%s for lin %{}",
+		    start_region, end_region, start_offset, end_offset,
+		    exclusive?"Exclusive":"Shared",
+		    lin_fmt(get_lin()));
+		goto out;
+	}
+	ilog(IL_TRACE,
+	    "Locked range %ld-%ld (offset %ld-%ld) "
+	    "in %s mode for lin %{} (%p)",
+	    start_region, end_region, start_offset, end_offset,
+	    exclusive?"Exclusive":"Shared",
+	    lin_fmt(get_lin()), this);
+
+#ifdef CHECK_LOCK_INFO
+	struct flock tmp_flock;
+	if (ifs_cpool_flock(fd_, LOCK_DOMAIN_CPOOL_CACHE, F_GETLK,
+		&tmp_flock, 0)) {
+		error = isi_system_error_new(errno,
+		    "Failed to get lock info for cacheheader debugging "
+		    "for lin %{}", lin_fmt(get_lin()));
+		// unlock the lock previously owned
+		ifs_cpool_flock(file_obj_->fd, LOCK_DOMAIN_CPOOL_CACHE,
+		    F_UNLCK, &region_flock, 0);
+		goto out;
+	}
+	ilog(IL_TRACE, "Locked range %ld-%ld (offset %ld-%ld) "
+	    "lock results: len %ld, type %{}",
+	    start_region, end_region, start_offset, end_offset,
+	    tmp_flock.l_len,
+	    cache_cpool_lock_type_fmt((enum cpool_lock_type)tmp_flock.l_type));
+#endif
+
+ out:
+	if (error)
+		isi_error_handle(error, error_out);
+}
+
+void
+cpool_cache::cache_unlock_region(size_t region, struct isi_error **error_out)
+{
+	cache_unlock_range(region, region, error_out);
+}
+
+void
+cpool_cache::cache_unlock_range(
+    size_t start_region,
+    size_t end_region,
+    struct isi_error **error_out)
+{
+	struct flock region_flock;
+	struct isi_error *error = NULL;
+	size_t start_offset = ISI_CBM_CACHE_LOCK_OFFSET(start_region);
+	size_t end_offset   = ISI_CBM_CACHE_LOCK_OFFSET(end_region);
+
+	if (start_region > end_region) {
+		error = isi_system_error_new(EINVAL,
+		    "Invalid unlock cache request"
+		    "range %ld-%ld (offset %ld-%ld) for lin %{}",
+		    start_region, end_region, start_offset, end_offset,
+		    lin_fmt(get_lin()));
+		goto out;
+	}
+
+	region_flock.l_start = start_offset;
+	region_flock.l_len = end_offset - start_offset + 1;
+	region_flock.l_pid = getpid();
+	region_flock.l_type = CPOOL_LK_UNLCK;
+	region_flock.l_whence = SEEK_SET;
+	region_flock.l_sysid = 0;
+
+	ilog(IL_TRACE,
+	    "About to unlock range %ld-%ld (offset %ld-%ld) "
+	    "for lin %{} (%p)",
+	    start_region, end_region, start_offset, end_offset,
+	    lin_fmt(get_lin()), this);
+	if (ifs_cpool_flock(fd_, LOCK_DOMAIN_CPOOL_CACHE, F_UNLCK,
+		&region_flock, 0)) {
+		error = isi_system_error_new(errno,
+		    "Failed to unlock cache "
+		    "range %ld-%ld (offset %ld-%ld) for lin %{}",
+		    start_region, end_region, start_offset, end_offset,
+		    lin_fmt(get_lin()));
+		goto out;
+	}
+	ilog(IL_TRACE, "Unlocked range %ld-%ld (offset %ld-%ld) "
+	    "for lin %{} (%p)",
+	    start_region, end_region, start_offset, end_offset,
+	    lin_fmt(get_lin()), this);
+ out:
+	if (error)
+		isi_error_handle(error, error_out);
+}
+
+void
+cpool_cache::cache_downgrade_region_to_shlock(size_t region,
+    struct isi_error **error_out)
+{
+	cache_downgrade_range_to_shlock(region, region, error_out);
+}
+
+void
+cpool_cache::cache_downgrade_range_to_shlock(
+    size_t start_region,
+    size_t end_region,
+    struct isi_error **error_out)
+{
+	struct flock region_flock;
+	struct isi_error *error = NULL;
+	size_t start_offset = ISI_CBM_CACHE_LOCK_OFFSET(start_region);
+	size_t end_offset   = ISI_CBM_CACHE_LOCK_OFFSET(end_region);
+
+	region_flock.l_start = start_offset;
+	region_flock.l_len = end_offset - start_offset + 1;
+	region_flock.l_pid = getpid();
+	region_flock.l_type = CPOOL_LK_SR;
+	region_flock.l_whence = SEEK_SET;
+	region_flock.l_sysid = 0;
+
+	ilog(IL_TRACE,
+	    "About to downgrade range %ld-%ld (offset %ld-%ld) "
+	    "for lin %{} (%p)",
+	    start_region, end_region, start_offset, end_offset,
+	    lin_fmt(get_lin()), this);
+	if (ifs_cpool_flock(fd_, LOCK_DOMAIN_CPOOL_CACHE, F_CONVERTLK,
+		&region_flock, 0)) {
+		error = isi_system_error_new(errno,
+		    "Failed to downgrade cache for "
+		    "range %ld-%ld (offset %ld-%ld) for lin %{}",
+		    start_region, end_region, start_offset, end_offset,
+		    lin_fmt(get_lin()));
+		goto out;
+	}
+	ilog(IL_TRACE,
+	    "Downgraded range %ld-%ld (offset %ld-%ld) for lin %{} (%p)",
+	    start_region, end_region, start_offset, end_offset,
+	    lin_fmt(get_lin()), this);
+ out:
+	if (error)
+		isi_error_handle(error, error_out);
+}
+
+void
+cpool_cache::refresh_header(struct isi_error **error_out)
+{
+	read_header(fd_, error_out);
+}
+
+isi_cbm_cache_status
+cpool_cache::cond_mark_cache_state(size_t region,
+    isi_cbm_cache_status current, isi_cbm_cache_status dest,
+    bool &changed, struct isi_error **error_out)
+{
+	isi_error *error = NULL;
+	bool locked = false;
+        bool header_locked = false;
+	isi_cbm_cache_status status = ISI_CPOOL_CACHE_INVALID;
+
+        cacheheader_lock(false, &error);
+        ON_ISI_ERROR_GOTO(out, error);
+        header_locked = true;
+
+	cache_lock_region(region, true, &error);
+	ON_ISI_ERROR_GOTO(out, error);
+
+	locked = true;
+	cache_info_read(region, &status, &error);
+	ON_ISI_ERROR_GOTO(out, error);
+
+	// If it is either unexpected, or already in the desired state,
+	// bail.
+	if (status != current || status == dest)
+		goto out;
+
+	UFAIL_POINT_CODE(cond_mark_cache_state_write_info_eio, {
+		error = isi_system_error_new(EIO,
+		    "Generated by failpoint before "
+		    "writing cache info for region %ld",
+		    region);
+	});
+	ON_ISI_ERROR_GOTO(out,error);
+
+	// otherwise, matched, change the state
+	cache_info_write(region, dest, &error);
+	ON_ISI_ERROR_GOTO(out, error);
+	changed = true;
+ out:
+	if (locked) {
+		cache_unlock_region(region, isi_error_suppress());
+		locked = false;
+	}
+        if (header_locked) {
+                cacheheader_unlock(isi_error_suppress());
+                header_locked = false;
+        }
+
+	isi_error_handle(error, error_out);
+	return status;
+}
+
+void
+cpool_cache::cache_destroy(int fd, struct isi_error **error_out)
+{
+	isi_error *error = NULL;
+	int ret = 0;
+
+	if (dir_fd_ == -1) {
+		/*
+		 * Open the ADS directory holding all streams.
+		 */
+		dir_fd_ = enc_openat(fd, "." , ENC_DEFAULT, O_RDONLY|O_XATTR);
+		if (dir_fd_ < 0 && errno != ENOENT) {
+			error = isi_system_error_new(errno,
+			    "Opening ADS stream directory fd: %d", fd);
+			goto out;
+		}
+		if (dir_fd_ < 0)
+			goto out;
+	}
+
+	if (fd_ != -1) {
+		close(fd_);
+		fd_ = -1;
+	}
+
+	ret = enc_unlinkat(dir_fd_, ISI_CBM_CACHE_CACHEINFO_NAME,
+	     ENC_DEFAULT, 0);
+	if (ret == -1 &&  errno != ENOENT) {
+		*error_out = isi_system_error_new(errno,
+		    "Deleting cacheinfo ADS");
+		goto out;
+	}
+ out:
+	isi_error_handle(error, error_out);
+}
+
+off_t
+cpool_cache::get_filesize(struct isi_error **error)
+{
+	return (isi_cbm_file_get_filesize(file_obj_, error));
+}
+
+/*
+ * Handle the case where the initial invalidation of a file performed as part
+ * of the archive process fails between the truncate and extend.  The failure
+ * is cleaned up by attempting the invalidation again as the original size of
+ * the file has been recorded.
+ */
+void
+cpool_cache::check_invalidate(struct isi_error **error_out)
+{
+	struct isi_error *error = NULL;
+	struct stat stat = {0};
+	uint32_t cpool_flags = 0;
+	int status = 0;
+
+	if ((file_obj_== NULL) || (file_obj_->fd == -1)) {
+		error = isi_cbm_error_new(CBM_CACHEINFO_ERROR,
+		    "Cannot check invalidate for lin %{}, "
+		    "File object is not open (%p)",
+		    lin_fmt(get_lin()), this);
+		goto out;
+	}
+
+	if (fstat(file_obj_->fd, &stat) == -1) {
+		error = isi_system_error_new(errno,
+		    "Cannot stat file %{} "
+		    "for check_invalidate",
+		    isi_cbm_file_fmt(file_obj_));
+		goto out;
+	}
+
+	if ((stat.st_flags & UF_HASADS) != 0) {
+		goto out;
+	}
+
+	status = extattr_get_fd(file_obj_->fd, ISI_CFM_MAP_ATTR_NAMESPACE,
+	    ISI_CFM_USER_ATTR_FLAGS, &cpool_flags, sizeof(u_int32_t));
+	if (status == -1) {
+		if (errno != ENOATTR) {
+			error = isi_system_error_new(errno,
+			    "Cannot get attributes for %{} "
+			    "for check_invalidate",
+			    isi_cbm_file_fmt(file_obj_));
+		}
+		goto out;
+	}
+
+	if ((cpool_flags & IFS_CPOOL_FLAGS_STUB_MARKED) &&
+	    (cpool_flags & IFS_CPOOL_FLAGS_TRUNCATED) &&
+	    !(cpool_flags & IFS_CPOOL_FLAGS_INVALIDATED)) {
+		/*
+		 * Perform the actual invalidate of the date in the cache file,
+		 * returning -1 on failure.
+		 */
+		status = ifs_cpool_stub_ops(file_obj_->fd,
+		    IFS_CPOOL_STUB_INVALIDATE_DATA, 0, NULL, NULL, NULL);
+		if (status == -1) {
+			if (errno == EEXIST)
+				error = isi_cbm_error_new(
+				    CBM_STUB_INVALIDATE_ERROR,
+				    "Could not invalidate blocks for stub file "
+				    "lin: %{}", lin_fmt(get_lin()));
+			else
+				error = isi_system_error_new(errno,
+				    "Unable to invalidate cache for %{}",
+				    lin_fmt(get_lin()));
+			goto out;
+		}
+	}
+
+ out:
+	isi_error_handle(error, error_out);
+
+	return;
+}

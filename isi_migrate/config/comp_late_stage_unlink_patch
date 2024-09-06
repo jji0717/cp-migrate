@@ -1,0 +1,3 @@
+#!/bin/sh
+
+touch /ifs/.ifsvar/modules/tsm/config/comp_late_stage_unlink_patch

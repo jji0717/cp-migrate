@@ -1,0 +1,62 @@
+/* -*- mode:c -*- */
+/* vim:set filetype=c: */
+%copy h
+#define OSTORE_OSTORE_CONFIG_NAME            "ostore.gc"
+#define OSTORE_OSTORE_CONFIG_LK_NAME         OSTORE_OSTORE_CONFIG_NAME".lck"
+
+#define OSTORE_OBJECT_NAME_HASH_THRESHOLD    64
+#define	OSTORE_OBJECT_NAME_HASH_LEFT_COUNT   32
+#define	OSTORE_OBJECT_NAME_HASH_RIGHT_COUNT  32
+#define OSTORE_OBJECT_NAME_RESTRICTED_CHARS  "/%" /* and what else? */
+#define OSTORE_OBJECT_NAME_SPLIT_INSERT      ".."
+#define OSTORE_OBJECT_NAME_HASHTO_DEFAULT    -1
+#define OSTORE_OBJECT_MAX_HASH_COLLISIONS    10000
+#define OSTORE_OBJECT_MAX_BUCKETS            100
+#define OSTORE_OBJECT_RECREATE_BUCKET        true
+
+#define OSTORE_DEFAULT_SID_UNSPECIFIED       ""
+
+%copyend
+
+%enum ordering_options {
+	 ORDERING_DEFAULT	=-1,
+	 ORDERING_ON	(On)	= 16,
+	 ORDERING_OFF	(Off)
+};
+
+%enum version_options {
+	 VERSIONING_DEFAULT		=-1,
+	 VERSIONING_OFF		(Off)	= 32,
+	 VERSIONING_SINGLE	(Single),
+	 VERSIONING_MULTIPLE	(Multiple)
+};
+
+%enum accounting_options {
+	 ACCOUNTING_DEFAULT	=-1,
+	 ACCOUNTING_ON	(On)	= 48,
+	 ACCOUNTING_OFF	(Off)
+};
+
+%dir ostore_parameters {
+	int hash_name_split_length = OSTORE_OBJECT_NAME_HASH_THRESHOLD;
+	int hash_name_split_left = OSTORE_OBJECT_NAME_HASH_LEFT_COUNT;
+	int hash_name_split_right = OSTORE_OBJECT_NAME_HASH_RIGHT_COUNT;
+	char *hash_name_split_insert = OSTORE_OBJECT_NAME_SPLIT_INSERT;
+	char *hash_name_translate = OSTORE_OBJECT_NAME_RESTRICTED_CHARS;
+	int hash_name_hashto = OSTORE_OBJECT_NAME_HASHTO_DEFAULT;
+	int hash_name_max_collisions = OSTORE_OBJECT_MAX_HASH_COLLISIONS;
+	int max_buckets = OSTORE_OBJECT_MAX_BUCKETS;
+	bool recreate_bucket = OSTORE_OBJECT_RECREATE_BUCKET;
+	char *ostore_default_sid = OSTORE_DEFAULT_SID_UNSPECIFIED;
+}
+
+%dir iobj_ostore_attrs {
+	enum ordering_options	ordering   = ORDERING_OFF;
+	enum accounting_options	accounting = ACCOUNTING_OFF;
+	enum version_options	versioning = VERSIONING_OFF;
+}
+
+%dir {global} ostore_config {
+	dir iobj_ostore_attrs ostore_attrs;
+	dir ostore_parameters  ostore_params;
+}

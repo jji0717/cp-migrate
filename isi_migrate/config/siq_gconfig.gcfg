@@ -1,0 +1,610 @@
+%copy c
+#include "isi_migrate/config/siq_util.h"
+%copyend
+%copy h
+#include "isi_cpool_bkup/isi_cpool_bkup_sync.h"
+%copyend
+
+//Enumerations
+%enum siq_state {
+	SIQ_ST_OFF (off) = 0,
+	SIQ_ST_ON (on),
+	SIQ_ST_PAUSED (paused),
+	SIQ_ST_TOTAL (total)
+};
+
+%enum mirror_state {
+	SIQ_MIRROR_OFF(mirror_off) = 0,
+	SIQ_MIRROR_ON(mirror_on)
+};
+
+%enum siq_sync_type {
+	ST_INVALID (invalid) = -1,
+	ST_LEGACY (legacy) = 0,
+	ST_INITIAL (initial) = 1,
+	ST_INCREMENTAL (incremental) = 2,
+	ST_UPGRADE (upgrade) = 3,
+	ST_FOFB (fofb) = 4,
+	ST_DOMAINMARK (domainmark) = 5
+};
+
+%enum siq_job_state {
+	SIQ_JS_INVALID (invalid) = -1,
+	SIQ_JS_NONE (none) = 0,
+	SIQ_JS_SCHEDULED (scheduled),
+	SIQ_JS_RUNNING (running),
+	SIQ_JS_PAUSED (paused),
+	SIQ_JS_SUCCESS (success),
+	SIQ_JS_FAILED (failed),
+	SIQ_JS_CANCELLED (cancelled),
+	SIQ_JS_SUCCESS_ATTN (success with failures),
+	SIQ_JS_SKIPPED (skipped),
+	SIQ_JS_PREEMPTED (preempted),
+	SIQ_JS_TOTAL (total)
+};
+
+%enum siq_action_type {
+	SIQ_ACT_NOP (noop) = 0,
+	SIQ_ACT_REPLICATE (copy),
+	SIQ_ACT_MIGRATE (move),
+	SIQ_ACT_REMOVE (remove),
+	SIQ_ACT_SYNC (sync),
+	SIQ_ACT_FAILOVER (failover),
+	SIQ_ACT_FAILOVER_REVERT (failoverrevert),
+	SIQ_ACT_FAILBACK_PREP (failbackprep),
+	SIQ_ACT_FAILBACK_PREP_DOMAIN_MARK (failbackprepdomainmark),
+	SIQ_ACT_FAILBACK_PREP_RESTORE (failbackpreprestore),
+	SIQ_ACT_FAILBACK_PREP_FINALIZE (failbackprepfinalize),
+	SIQ_ACT_FAILBACK_SYNC (failbacksync),
+	SIQ_ACT_FAILBACK_COMMIT (failbackcommit),
+	SIQ_ACT_SNAP_REVERT_DOMAIN_MARK (snaprevertdomainmark),
+	SIQ_ACT_SYNCIQ_DOMAIN_MARK (synciqdomainmark),
+	SIQ_ACT_WORM_DOMAIN_MARK (wormdomainmark),
+	SIQ_ACT_TOTAL (total)
+};
+
+%enum siq_snapmode {
+	SIQ_SNAP_NONE (none) = 0,
+	SIQ_SNAP_MAKE (make),
+	SIQ_SNAP_PRESET (preset),
+	SIQ_SNAP_TOTAL (total)
+};
+
+%enum siq_src_pathtype {
+	SIQ_INCLUDE (include) = 0,
+	SIQ_EXCLUDE (exclude),
+	SIQ_PATHTYPES (total)
+};
+
+%enum bwt_state {
+	BWT_ST_OFF (off) = 0,
+	BWT_ST_ON (on),
+	BWT_ST_TOTAL (total)
+};
+
+%enum stf_job_phase {
+	STF_PHASE_TW = 1,
+	STF_PHASE_IDMAP_SEND,
+	/* 
+	 * Lets leave some space in case we add more
+	 * TW related states in future
+	 */
+	STF_PHASE_SUMM_TREE = 10,
+	STF_PHASE_CC_DIR_DEL,
+	STF_PHASE_CC_DIR_CHGS,
+	STF_PHASE_CT_LIN_UPDTS,
+	STF_PHASE_CT_LIN_HASH_EXCPT,
+	STF_PHASE_CT_FILE_DELS,
+	STF_PHASE_CT_DIR_DELS,
+	STF_PHASE_CT_DIR_LINKS,
+	STF_PHASE_CT_DIR_LINKS_EXCPT,
+	STF_PHASE_CT_STALE_DIRS,
+	STF_PHASE_FLIP_LINS,
+	STF_PHASE_DOMAIN_MARK,
+	STF_PHASE_DATABASE_CORRECT,
+	STF_PHASE_DATABASE_RESYNC,
+	STF_PHASE_CC_COMP_RESYNC,
+	STF_PHASE_COMP_CONFLICT_CLEANUP,
+	STF_PHASE_COMP_CONFLICT_LIST,
+	STF_PHASE_CT_COMP_DIR_LINKS,
+	STF_PHASE_COMP_COMMIT,
+	STF_PHASE_COMP_MAP_PROCESS,
+	STF_PHASE_COMP_FINISH_COMMIT,
+	STF_PHASE_CT_COMP_DIR_DELS,
+	STF_PHASE_FINISH
+};
+
+%enum rpo_state {
+	RPO_ST_OFF (off) = 0,
+	RPO_ST_ON (on),
+	RPO_ST_TOTAL (total)
+};
+
+%enum siq_deep_copy {
+	SIQ_DEEP_COPY_DENY (deny) = DCO_DENY,
+	SIQ_DEEP_COPY_ALLOW (allow) = DCO_ALLOW,
+	SIQ_DEEP_COPY_FORCE (force) = DCO_FORCE,
+	SIQ_DEEP_COPY_CHANGED_FLAG (changed_flag) = 10000
+};
+
+//SIQ Global Config
+%dir {global} siq_conf {
+	dir siq_conf_application application;
+	/* Global system state: enabled/disabled */
+	enum siq_state state = SIQ_ST_ON;
+	dir siq_conf_coordinator coordinator;
+	dir siq_conf_bwt bwt;
+	dir siq_conf_scheduler scheduler;
+	dir siq_conf_reports reports;
+}
+
+%dir siq_conf_application {
+	/* Max number of total sworkers that can run on a sync 
+	 * target node at a given time. */
+	int max_sworkers_per_node = 100;
+	/* Override the msg handshake POL_DENY_FALLBACK policy in case
+	 * we need to relax the rules. */
+	int deny_fallback_min_ver_override;
+	/* Override the socket connection timeout used in connect_to */
+	int connect_timeout;
+	bool force_sparse_writes = false;
+	/* Memory usage limit for burst socket in bytes */
+	int burst_mem_constraint = 20971520;
+	/* SyncIQ burst socket buffer size for msgs in bytes */
+	int burst_sock_buf_size = 10485760;
+	/* During treewalk, the max number of seconds between updating
+	 * work item checkpoints. */
+	time_t tw_chkpt_interval = 600;
+	int max_concurrent_snapshots = 15;
+	int work_item_lock_timeout = 600;
+	bool flip_lin_verify = false;
+}
+
+%dir siq_conf_coordinator {
+	dir siq_conf_coordinator_ports ports;
+	/* This is the default WPN that gets copied into each policy */
+	int workers_per_node = 3;
+	/* A list of global includes/excludes */
+	list dir siq_policy_path paths { c_list_type:SLIST, link:next, name:path };
+	/* A complete path to password file 
+	 * (default is application.workdir + /passwd) */
+	char *passwd_file = "/ifs/.ifsvar/modules/tsm/passwd";
+	/* A pattern to be used for naming newly created snapshots */
+	char *snapshot_pattern = "SIQ-%d-%m-%Y-%T";
+	/* Maximum time allowed to be in the pause state. */
+	time_t pause_limit = 604800;
+	/* Transfer samba/likewise mapping tables. */
+	int samba_backup_enabled = 1;
+	/* Max total number of workers for a single policy across all nodes.  
+	 * Ignored for clusters small enough that the policy's workers-per-node 
+	 * dominates. */
+	int max_wperpolicy = 500;
+	/* Socket buffer size used by workers */
+	int wsock_buf_size = 1;
+	/* Read buffer size used by workers */
+	int wread_buf_size = 1;
+	
+	/* Default Flexnet configuration settings */
+	char *default_restrict_by = "";
+	int default_target_restrict = 0;
+	int default_force_interface = 0;
+	
+	/* Max number of retries for work item reassignment */
+	int max_work_item_retry = 10;
+	
+	/* Configure usage of bandwidth/throttle */
+	int skip_bw_host = 0;
+	int skip_th_host = 0;
+	int skip_work_host = 0;
+
+	/* Worker Pools upgrade fallback */
+	bool force_workers_per_node = false;
+}
+
+%dir siq_conf_coordinator_ports {
+	uint16_t pworker = 2098;
+	uint16_t sworker = 5667;
+	uint16_t burst_recv_port_min = 3000;
+	uint16_t burst_recv_port_max = 3020;
+	uint16_t burst_send_port_min = 0;
+	uint16_t burst_send_port_max = 0;
+}
+
+%dir siq_conf_bwt {
+	char *host = "localhost";
+	uint16_t port = 3148;
+	uint16_t cpu_port = 3149;
+	/* Bandwidth key file name in bwt.work_dir (by default bandwidth.key) */
+	char *bw_key_file = "bandwidth.key";
+	/* Throttle key file name in bwt.work_dir (by default bandwidth.key) */
+	char *th_key_file = "throttle.key";
+	/* CPU key file name in bwt.work_dir (by default cpu.key) */
+	char *cpu_key_file = "cpu.key";
+	/* Worker key file name in bwt.work_dir (by default worker.key) */
+	char *worker_key_file = "worker.key";
+	int log_rotate_period = 86400;
+	int force_lnn = -1;
+	int max_workers_per_cluster = -1;
+	int max_workers_per_node = -1;
+	/* If -1, each node calculates the number of workers it can support
+	 * based on its hardware. If set to a value, each node will skip their
+	 * calculations and use this number instead. No matter what this value
+	 * is, workers per node will still be capped at max_workers_per_node */
+	int set_workers_per_node = -1;
+	int workers_per_cpu = 4;
+	int workers_per_node_per_job = 8;
+}
+
+%dir siq_conf_scheduler {
+	/* Scheduler pid file path */
+	char *pid_file = "/var/run/isi_sched_d.pid";
+	/* Scheduler interval for polling for quorum in seconds */
+	time_t quorum_poll_interval = 30;
+	/* Scheduler interval for re-reading the global policies list in seconds */
+	time_t policies_poll_interval = 10; //TODO FOR REAL SUPPORT
+	/* Max number of concurrent jobs to allow cluster-wide. */
+	int max_concurrent_jobs = 50;
+	/* Minimum workers a job should be constrained to using. */
+	int min_workers_per_policy = 1;
+	/* Scheduler log level override mainly for test purposes */
+	int log_level = INFO;
+	/* Disable periodic rotate reports in scheduler */
+	int disable_rotate_reports = 0;
+	/* Automated reports rotation interval (seconds) */
+	int rotate_reports_interval = 86400;
+	/* Last run time for automated reports rotation */
+	time_t last_rotate_reports_run = 0;
+	/* RPO alert state enabled/disabled */
+	enum rpo_state rpo_alerts = RPO_ST_ON;
+}
+
+%dir siq_conf_reports {
+	char *rotation_period = "365days";
+	list dir siq_string_list addresses { c_list_type:SLIST, link:next };
+	int auto_send_email = 0;
+	int max = 2000;
+	int sqlite_cache_size = 110000;
+	int sqlite_unsafe_mode = 0;
+	int policy_sync = 0;
+}
+
+//SIQ Policies and Spec
+%dir {global} siq_policies_root {
+	list dir siq_policy policy { c_list_type:SLIST, link:next };
+}
+
+%dir siq_policy {
+	dir siq_policy_common common;
+	dir siq_policy_scheduler scheduler;
+	dir siq_policy_coordinator coordinator;
+	dir siq_policy_datapath datapath;
+	dir siq_policy_target target;
+	SLIST_ENTRY next;
+}
+
+%dir {global} siq_spec {
+	dir siq_policy_common common;
+	dir siq_policy_coordinator coordinator;
+	dir siq_policy_datapath datapath;
+	dir siq_policy_target target;
+}
+
+%dir siq_policy_common {
+	char *name;
+	char *desc;
+	char *pid;
+	char *mirror_pid;
+	enum siq_action_type action;
+	int log_level = INFO;
+	enum siq_state state;
+	enum mirror_state mirror_state;
+	time_t creation_time;
+}
+
+%dir siq_policy_scheduler {
+	char *schedule;
+	int max_reports;
+	time_t rotate_report_period;
+	char *snapshot_sync_pattern;
+	bool snapshot_sync_existing;
+	time_t job_delay;
+	bool skip_when_source_unmodified;
+	int priority;
+	time_t rpo_alert;
+}
+
+%dir siq_policy_coordinator {
+	int workers_per_node = 3;
+	int log_removed_files;
+	int diff_sync = 0;
+	int skip_bb_hash = 0;
+	int rename_expiration;
+	char *rename_pattern;
+	int check_integrity = 1;
+	enum siq_snapmode dst_snapshot_mode = SIQ_SNAP_NONE;
+	char *snapshot_pattern = "SIQ-%{SrcCluster}-%{PolicyName}-%Y-%m-%d_%H-%M-%S";
+	char *snapshot_alias = "SIQ-%{SrcCluster}-%{PolicyName}-latest";
+	time_t snapshot_expiration;
+	int changelist;
+	int disable_file_split;
+	int expected_dataloss = 0;
+	int disable_bulk_lin_map = 0;
+	bool accelerated_failback;
+	int limit_work_item_retry = 1;
+	enum siq_deep_copy deep_copy = SIQ_DEEP_COPY_DENY;
+}
+
+%dir siq_policy_datapath {
+	char *src_cluster_name;
+	char *datapath_hash;
+	char *root_path;
+	list dir siq_policy_path paths { c_list_type:SLIST, link:next, name:path };
+	char *predicate = "";
+	int disable_stf;
+	time_t siq_v1_lastrun;
+	enum siq_snapmode src_snapshot_mode = SIQ_SNAP_MAKE;
+	int burst_mode;
+	int disable_fofb;
+}
+
+%dir siq_policy_target {
+	char *dst_cluster_name;
+	char *password;
+	char *path;
+	char *restrict_by = "";
+	int target_restrict = 0;
+	int force_interface = 0;
+	int skip_lookup = 0;
+	int work_item_lock_mod = 10;
+	bool enable_hash_tmpdir;
+}
+
+%dir siq_policy_path {
+	enum siq_src_pathtype type;
+	char *path;
+	SLIST_ENTRY next;
+}
+
+//SIQ Job and Report
+%dir {global} siq_job_summary_root {
+	dir siq_job_summary summary;
+}
+
+%dir siq_job_summary {
+	dir siq_job_total total;
+	dir siq_job_chunks chunks;
+	enum siq_sync_type sync_type;
+	enum siq_action_type action;
+	bool assess;
+	int retry;
+	char *error;
+	list dir siq_string_list errors { c_list_type:SLIST, link:next };
+	list dir siq_string_list warnings { c_list_type:SLIST, link:next };
+	dir siq_job_snapshots snapshots;
+	int dead_node;
+	uint32_t num_retransmitted_files;
+	list dir siq_string_list retransmitted_files { c_list_type:SLIST, link:next };
+	list dir siq_phase_history phases { c_list_type:SLIST, link:next };
+	int total_phases;
+	list dir siq_worker workers { c_list_type:SLIST, link:next };
+	dir siq_spec job_spec;
+	uint32_t job_id;
+	//add sra job guid id to track sra initiated job
+	char *sra_id;
+}
+
+%dir siq_job_total {
+	dir siq_stat stat;
+	time_t start;
+	time_t end;
+	enum siq_job_state state; 
+}
+
+%dir siq_stat {
+	dir siq_stat_dirs dirs;
+	dir siq_stat_files files;
+	dir siq_stat_bytes bytes;
+	dir siq_stat_change_compute change_compute;
+	dir siq_stat_change_transfer change_transfer;
+	dir siq_stat_compliance compliance;
+}
+
+%dir siq_stat_dirs {
+	dir siq_stat_dirs_src src;
+	dir siq_stat_dirs_dst dst;
+	dir siq_stat_srcdst created;
+	dir siq_stat_srcdst deleted;
+	dir siq_stat_srcdst linked;
+	dir siq_stat_srcdst unlinked;
+	uint32_t replicated;
+}
+
+%dir siq_stat_dirs_src {
+	uint32_t visited;
+}
+
+%dir siq_stat_dirs_dst {
+	uint32_t deleted;
+}
+
+%dir siq_stat_srcdst {
+	uint32_t src;
+	uint32_t dst;
+}
+
+%dir siq_stat_files {
+	uint32_t total;
+	dir siq_stat_files_replicated replicated;
+	dir siq_stat_srcdst deleted;
+	dir siq_stat_srcdst linked;
+	dir siq_stat_srcdst unlinked;
+	dir siq_stat_files_skipped skipped;
+}
+
+%dir siq_stat_files_replicated {
+	uint32_t selected;
+	uint32_t transferred;
+	uint32_t new_files;
+	uint32_t updated_files;
+	uint32_t regular;
+	uint32_t files_with_ads;
+	uint32_t ads_streams;
+	uint32_t symlinks;
+	uint32_t block_specs;
+	uint32_t char_specs;
+	uint32_t sockets;
+	uint32_t fifos;
+	uint32_t hard_links;
+}
+
+%dir siq_stat_files_skipped {
+	uint32_t up_to_date;
+	uint32_t user_conflict;
+	uint32_t error_io;
+	uint32_t error_net;
+	uint32_t error_checksum;
+}
+
+%dir siq_stat_bytes {
+	uint64_t transferred;
+	uint64_t recoverable;
+	dir siq_stat_srcdst recovered;
+	dir siq_stat_bytes_data data;
+	dir siq_stat_bytes_network network;
+}
+
+%dir siq_stat_bytes_data {
+	uint64_t total; 
+	uint64_t file;
+	uint64_t sparse;
+	uint64_t unchanged;
+}
+
+%dir siq_stat_bytes_network {
+	uint64_t total;
+	uint64_t to_target;
+	uint64_t to_source;
+}
+
+%dir siq_stat_change_compute {
+	uint32_t lins_total;
+	uint32_t dirs_new;
+	uint32_t dirs_deleted;
+	uint32_t dirs_moved;
+	uint32_t dirs_changed;
+	uint32_t files_new;
+	uint32_t files_linked;
+	uint32_t files_unlinked;
+	uint32_t files_changed;
+}
+
+%dir siq_stat_change_transfer {
+	uint32_t hash_exceptions_found;
+	uint32_t hash_exceptions_fixed;
+	uint32_t flipped_lins;
+	uint32_t corrected_lins;
+	uint32_t resynced_lins;
+}
+
+%dir siq_stat_compliance {
+	uint32_t resync_compliance_dirs_new;
+	uint32_t resync_compliance_dirs_linked;
+	uint32_t resync_conflict_files_new;
+	uint32_t resync_conflict_files_linked;
+	uint32_t conflicts;
+	uint32_t committed_files;
+}
+
+%dir siq_job_chunks {
+	uint32_t total;
+	uint32_t running;
+	uint32_t success;
+	uint32_t failed;
+}
+
+%dir siq_string_list {
+	char *msg;
+	SLIST_ENTRY next;
+}
+
+%dir siq_job_snapshots {
+	list dir siq_string_list target { c_list_type:SLIST, link:next };
+}
+
+%dir siq_phase_history {
+	enum stf_job_phase phase;
+	time_t start;
+	time_t end;
+	SLIST_ENTRY next;
+}
+
+%dir siq_worker {
+	uint32_t worker_id;
+	uint32_t process_id;
+	bool connected;
+	uint64_t lin;
+	time_t last_split;
+	time_t last_work;
+	char *source_host;
+	char *target_host;
+	uint32_t lnn;
+%verbatim SLIST_ENTRY(siq_worker) next;
+}
+
+%dir {global} siq_job_version {
+	/* The committed version of the local cluster at the time of the
+	 * first coordinator-tmonitor handshake for a given job. The local
+	 * cluster SHOULD operate at the corresponding feature level for the
+	 * lifetime of the job. */
+	uint32_t local;
+
+	/* The version resulting from the first coordinator-tmonitor handshake
+	 * for a given job. Inter-cluster communication SHOULD adhere to this
+	 * protocol version for the lifetime of the job. */
+	uint32_t common;
+}
+
+%dir {global} bwt_conf {
+	list dir bwt_limit bw { c_list_type:SLIST, link:next };
+	list dir bwt_limit th { c_list_type:SLIST, link:next };
+	list dir bwt_limit cpu { c_list_type:SLIST, link:next };
+	list dir bwt_limit work { c_list_type:SLIST, link:next };
+}
+
+%dir bwt_limit {
+	dir bwt_schedule schedule;
+	char *desc;
+	int limit;
+	enum bwt_state state;
+	SLIST_ENTRY next;
+}
+
+%dir bwt_schedule {
+	uint8_t days;
+	uint16_t start;
+	uint16_t end;
+}
+
+%dir {global} sched_locked_snaps_root {
+	list dir sched_locked_snap locked_snap { c_list_type:SLIST, link:next };
+}
+
+%dir sched_locked_snap {
+	uint64_t snap_id;
+	SLIST_ENTRY next;
+}
+
+//SIQ Alerts
+%dir {global} siq_active_alert_root {
+	list dir siq_active_alert alert { c_list_type:SLIST, link:next };
+}
+
+%dir siq_active_alert {
+	/* alert have a corresponding celog event id and behavior */
+	uint32_t celog_eid;
+
+	/* time of last success for recurring alerts (RPO) */
+	time_t last_success;
+
+	SLIST_ENTRY next;
+}

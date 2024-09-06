@@ -1,0 +1,16 @@
+package isi_cbm_pb;
+
+/*
+ * Protobuf definitions for serializable cbm entities
+ */
+
+message isi_cbm_file_version
+{
+	optional int64 num = 1;
+	optional int64 flags = 2;
+}
+
+message isi_cbm_file_versions
+{
+	repeated isi_cbm_file_version version = 1;
+}

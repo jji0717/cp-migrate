@@ -1,0 +1,108 @@
+# This file contains options common to Migration parts that we may want to
+# change altogether
+
+#BINOWN!=	id -un
+#BINGRP!=	id -gn
+#MANOWN?=	${BINOWN}
+#MANGRP?=	${BINGRP}
+TSM_TOP?=	${ISI_TOP}/bin/isi_migrate
+#LIBC=		/usr/lib/libc.a
+#DESTDIR?=	${TSM_TOP}/install
+
+DEBUG_FLAGS += -g
+.ifdef DEBUG
+  DEBUG_FLAGS += -O0 -D_DEBUG_
+.endif 
+# compiler flags for gcov
+.ifdef GCOV
+  CFLAGS += -fprofile-arcs -ftest-coverage
+.endif
+
+CLEANFILES += *.gcov *.gcda *.gcno
+CLEANFILES += .depend
+
+
+#CFLAGS+=	-I${.CURDIR}/../include
+#CFLAGS+=	-I${TSM_TOP}/include
+#CFLAGS+=	-I${TSM_TOP}/common/include
+#CFLAGS+=	-I${TSM_TOP}/parser/include
+
+#CFLAGS+=	-I${ISI_SRC}/lib/isi_config
+
+#LDFLAGS+=	-L${ISI_SRC}/bin/isi_migrate/common/src
+#LDADD+=		-lmd
+#LDADD+=		-lxml2
+#LDADD+=		-lz
+#LDADD+=		-ldevstat
+#LDADD+=		-lpthread
+#STRIP=
+
+#
+# Build tag
+#
+TAG?=		HEAD
+
+.if empty(BUILD)
+BUILDTS!=         date +%d%m%Y-%H:%M
+.ifdef TAG
+BUILD=		${TAG}-${BUILDTS}
+.else
+BUILD=		${BUILDTS}
+.endif
+.endif
+
+BUILD_DEPENDS+=		sqlite3:${PORTSDIR}/databases/sqlite3
+
+CFLAGS+=        -DBUILD=\"${BUILD}\"
+CFLAGS+=        -DCOORDNAME=\"/usr/bin/isi_migrate\"
+CFLAGS+=	-I/usr/local/include
+CFLAGS+=        -I${ISI_TOP}/lib/isi_burst_sdk/include
+CFLAGS+= -DFREEBSD -D__BSD_VISIBLE -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE -D_REENTRANT -DMULTITHREADED_ENV
+CFLAGS+= 	-DOS_IMPL_H=\"os_unix.h\" -DARCH=amd64
+
+#
+# QA build
+#
+.if defined(QA_BUILD)
+CFLAGS+=	-D_QA_
+.endif
+
+.if defined(NO_LIC)
+CFLAGS+=	-DNOLIC
+.endif
+
+.if defined(MSG_DEBUG_PRINT)
+CFLAGS+=	-DMSG_DEBUG_PRINT
+.endif
+
+#all: depend
+
+CHECK_LIBS+=	-L${ISI_OBJ}/lib/ifs -lifs
+CHECK_LIBS+=    -L${ISI_OBJ}/lib/isi_hw -lisi_hw
+CHECK_LIBS+=    -L${ISI_OBJ}/lib/isi_net -lisi_net
+CHECK_LIBS+=    -L${ISI_OBJ}/lib/isi_journal -lisi_journal
+CHECK_LIBS+=    -L${ISI_OBJ}/lib/isi_util -lisi_util
+CHECK_LIBS+=	-L${ISI_OBJ}/lib/isi_ufp -lisi_ufp
+CHECK_LIBS+=    -L${ISI_OBJ}/lib/isi_date -lisi_date
+CHECK_LIBS+=	-L${ISI_OBJ}/lib/isi_config -lisi_config
+CHECK_LIBS+=    -L${ISI_OBJ}/lib/isi_newfs -lisi_newfs
+CHECK_LIBS+=    -L${ISI_OBJ}/lib/isi_version -lisi_version
+CHECK_LIBS+=    -L${ISI_OBJ}/lib/isi_config -lisi_config
+CHECK_LIBS+=	-L${ISI_OBJ}/lib/isi_flexnet -lisi_flexnet
+CHECK_LIBS+=	-L${ISI_OBJ}/lib/isi_net -lisi_net
+CHECK_LIBS+=	-L${ISI_OBJ}/lib/isi_xml -lisi_xml
+CHECK_LIBS+=	-L${ISI_OBJ}/lib/isi_acl -lisi_acl
+CHECK_LIBS+=    -L${ISI_OBJ}/lib/isi_snapshot -lisi_snapshot
+CHECK_LIBS+=    -L${ISI_OBJ}/lib/isi_migrate/config -lisi_migrate
+CHECK_LIBS+=    -L${ISI_OBJ}/lib/isi_burst_sdk -lisi_burst_sdk
+CHECK_LIBS+=	-L${ISI_OBJ}/lib/isi_sbtree -lisi_sbtree
+CHECK_LIBS+=	-L${ISI_OBJ}/lib/isi_domain -lisi_domain
+CHECK_LIBS+=	-L${ISI_OBJ}/lib/isi_celog -lisi_celog
+CHECK_LIBS+=	-L${ISI_OBJ}/lib/isi_event -lisi_event
+CHECK_LIBS+=	-L${ISI_OBJ}/lib/isi_gmp -lisi_gmp
+CHECK_LIBS+=	-L${ISI_OBJ}/lib/isi_licensing -lisi_licensing
+CHECK_LIBS+=	-L${ISI_OBJ}/lib/isi_stats -lisi_stats
+CHECK_LIBS+=	-L${ISI_OBJ}/lib/isi_ilog -lisi_ilog
+CHECK_LIBS+=	-L${ISI_OBJ}/lib/isi_filter -lisi_filter
+CHECK_LIBS+=	-L/usr/local/lib -lsqlite3
+CHECK_LIBS+=	-lmd -lxml2 -lz -lutil -ldevstat -lthr

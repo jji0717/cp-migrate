@@ -1,0 +1,3 @@
+#!/bin/sh
+
+touch /ifs/.ifsvar/modules/tsm/config/target_work_locking_patch

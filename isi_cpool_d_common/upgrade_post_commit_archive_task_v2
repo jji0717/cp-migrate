@@ -1,0 +1,5 @@
+#!/bin/sh
+#
+# Post-commit hook for setting the archive task to V2
+
+touch /ifs/.ifsvar/modules/cloud/isi_cpool_d.archive.v2

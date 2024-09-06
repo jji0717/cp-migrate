@@ -1,0 +1,14 @@
+#!/bin/sh
+
+# This checks to see if the new image has the file ./var/db/version/cloud_archive_task
+# which for now indicates that cloudpool archive task uses V2 (only contains policy id rather than policy name),
+# eventually we want a more general solution
+
+tar -xOf /ifs/.ifsvar/upgrade/install.tar.gz ./var/db/versions/cloud_archive_task 2> /dev/null > /dev/null
+Error=$?
+
+if [ ${Error} -ne 0 ]; then
+    echo "Error, trying to upgrade to a version of OneFS where cloudpool's archive task does not allow rename of policy"
+fi
+
+exit ${Error}

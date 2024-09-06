@@ -1,0 +1,33 @@
+/* -*- mode:c -*- */
+/* vim:set filetype=c:miv */
+
+%copy h
+extern struct gci_tree *GCI_OAPI_CONFIG_TREE;
+%copyend
+
+%tree GCI_OAPI_CONFIG_TREE {
+      root               = oapi_cfg_root;
+      display_name       = "oapi";
+      primary_config     = "/var/ifs/oapi_config.gc";
+      fallback_config_ro = NULL;
+      change_log_file    = NULL;
+      defaults_config_ro = NULL;
+};
+
+%dir {global} oapi_cfg_root {
+	int			listen_backlog = 100;
+	char			*socket_path   = "/var/run/isi_object_d.sock";
+	char			*socket_owner  = "daemon";
+	char			*docroot       = "";
+	bool			debug          = false;
+	uint32_t      		init_log_level = 15;
+	uint64_t		max_sort_dir_sz = 100000;
+	char		*system_dirs = "/ifs/.ifsvar, /ifs/.object";
+	dir oapi_cfg_threads	pool;
+}
+
+%dir oapi_cfg_threads {
+	int 	max_threads = 50;
+	int 	max_waiting = 100;
+	bool	sync        = false;
+}
